@@ -1,3 +1,13 @@
+libfprint-fpc1022 (1.95.0) unstable; urgency=medium
+
+  * Release 1.95.0 with production-ready FPC 10a5:a920 driver.
+  * Add NIST SP 800-108 KDF and TLS 1.2 PSK client authentication.
+  * Add SIGFM feature matching for 64x176 capacitive sensors.
+  * Fix overheating shutdown condition (temp_hot_seconds = -1).
+  * Add cryptographic memory hygiene and unit tests.
+
+ -- feraxhp <feraxhp+gh@gmail.com>  Wed, 08 Oct 2026 21:00:00 -0500
+
 libfprint-fpc1022 (1.94.100) unstable; urgency=medium
 
   * Add fpc1022 driver for FPC Disum match-on-host sensors (10a5:9200).

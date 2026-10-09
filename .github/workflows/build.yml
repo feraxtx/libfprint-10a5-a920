@@ -25,7 +25,7 @@ jobs:
             image: ubuntu:26.04
             script: build-deb.sh
           - family: fedora
-            image: fedora:41
+            image: fedora:44
             script: build-rpm.sh
     container:
       image: ${{ matrix.image }}

@@ -12,7 +12,7 @@ while IFS= read -r file; do
     exit 1
   }
   cp "$file" "$output/$basename"
-done < <(find "$input" -type f \( -name '*.deb' -o -name '*.pkg.tar.*' \) | LC_ALL=C sort)
+done < <(find "$input" -type f \( -name '*.deb' -o -name '*.pkg.tar.*' -o -name '*.rpm' \) | LC_ALL=C sort)
 
 [[ $(find "$output" -maxdepth 1 -name '*.deb' | wc -l) -eq 1 ]]
 

@@ -1,6 +1,17 @@
 This file lists notable changes in each release. For the full history of all
 changes, see ChangeLog.
 
+2026-10-08: v1.95.0 release
+
+Highlights:
+  * fpc1022: New production-ready driver supporting FPC Disum 10a5:a920
+  * Full TLS 1.2 PSK client channel over USB bulk with NIST SP 800-108 KDF
+  * SIGFM matching for small-area 64x176 capacitive sensors with 2x scaling
+  * Fix thermal model overheating shutdown bug (temp_hot_seconds = -1)
+  * Cryptographic memory hygiene with OPENSSL_cleanse
+  * Automated C unit tests for KDF key derivation and TLS handshake
+  * Native Fedora RPM, Arch Linux, and Ubuntu packaging
+
 2026-07-25: v1.94.100 release
 
 Highlights:

@@ -39,7 +39,8 @@
 ```bash
 # Install build dependencies
 sudo dnf install -y gcc gcc-c++ meson ninja-build glib2-devel libgusb-devel \
-    pixman-devel systemd-devel libgudev-devel openssl-devel opencv-devel cairo-devel
+    pixman-devel systemd-devel libgudev-devel openssl-devel opencv-devel cairo-devel \
+    gobject-introspection-devel
 
 # Configure build with Fedora paths
 meson setup --reconfigure builddir --prefix=/usr --libdir=/usr/lib64

@@ -30,7 +30,7 @@ Rules-Requires-Root: no
 Package: libfprint-fpc1022
 Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Provides: libfprint-2-2 (= 1:1.94.100), libfprint-2-dev, gir1.2-fprint-2.0
+Provides: libfprint-2-2 (= 1:1.95.0), libfprint-2-dev, gir1.2-fprint-2.0
 Conflicts: libfprint-2-2, libfprint-2-dev, gir1.2-fprint-2.0
 Replaces: libfprint-2-2, libfprint-2-dev, gir1.2-fprint-2.0
 Suggests: fprintd

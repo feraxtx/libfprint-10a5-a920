@@ -1,7 +1,7 @@
 # Maintainer: feraxhp <feraxhp+gh@gmail.com>
 
 pkgname=libfprint-fpc1022
-pkgver=1.94.100
+pkgver=1.95.0
 pkgrel=1
 pkgdesc='libfprint with FPC 10a5:a920 support'
 arch=('x86_64')
@@ -32,7 +32,7 @@ makedepends=(
 )
 checkdepends=('cairo' 'umockdev')
 optdepends=('fprintd: D-Bus daemon and PAM module for fingerprint readers')
-provides=('libfprint=1.94.100' 'libfprint-2.so')
+provides=('libfprint=1.95.0' 'libfprint-2.so')
 conflicts=('libfprint')
 source=("$pkgname::git+https://github.com/feraxtx/libfprint-10a5-a920.git#tag=v$pkgver")
 sha256sums=('SKIP')
