@@ -1,95 +1,134 @@
-
-
 <div align="center">
 
-# LibFPrint
+# LibFPrint with FPC 10a5:a920 Driver Support
 
-*LibFPrint is part of the **[FPrint][Website]** project.*
+*LibFPrint fork providing production-ready match-on-host support for **FPC 10a5:a920** fingerprint sensors.*
 
 <br/>
 
-[![Button Website]][Website]
-[![Button Documentation]][Documentation]
-
-[![Button Supported]][Supported]
-[![Button Unsupported]][Unsupported]
-
-[![Button Contribute]][Contribute]
-[![Button Contributors]][Contributors]
+[![Build packages](https://github.com/feraxtx/libfprint-10a5-a920/actions/workflows/build.yml/badge.svg)](https://github.com/feraxtx/libfprint-10a5-a920/actions/workflows/build.yml)
+[![License: LGPL 2.1](https://img.shields.io/badge/License-LGPL2.1-015d93.svg?style=flat-square)](./COPYING)
 
 </div>
 
-## History
+---
 
-**LibFPrint** was originally developed as part of an
-academic project at the **[University Of Manchester]**.
+## Supported Devices
 
-It aimed to hide the differences between consumer
-fingerprint scanners and provide a single uniform
-API to application developers.
+| USB ID | Vendor / Model | Laptop Models | Driver | Matching Engine |
+|---|---|---|---|---|
+| `10a5:a920` | FPC (Fingerprint Cards AB) Disum | HONOR HGE-WX6, MagicBook, Huawei MateBook | `fpc1022` | SIGFM (SIFT Keypoints) |
 
-## Goal
+---
 
-The ultimate goal of the **FPrint** project is to make
-fingerprint scanners widely and easily usable under
-common Linux environments.
+## Features
+
+- **TLS 1.2 PSK Client**: End-to-end encrypted session over USB using NIST SP 800-108 KDF and AES-256-CBC sealed key derivation.
+- **SIGFM Matching**: Reliable match-on-host keypoint detection tuned for 64x176 capacitive sensors with 2x nearest-neighbor upscaling.
+- **Power Management & Autosuspend**: Full integration with `udev` and `hwdb` autosuspend rules.
+- **Continuous Operation**: Thermal model configured for continuous operation without spurious overheating timeouts.
+- **Cryptographic Memory Hygiene**: Automatic cleansing of sensitive keys and PSKs with `OPENSSL_cleanse()`.
+
+---
+
+## Quick Installation
+
+### Fedora (40, 41, 42, 43, 44)
+
+#### Option A: Direct Build & System Install
+```bash
+# Install build dependencies
+sudo dnf install -y gcc gcc-c++ meson ninja-build glib2-devel libgusb-devel \
+    pixman-devel systemd-devel libgudev-devel openssl-devel opencv-devel cairo-devel
+
+# Configure build with Fedora paths
+meson setup --reconfigure builddir --prefix=/usr --libdir=/usr/lib64
+
+# Compile and run test suite
+meson compile -C builddir
+meson test -C builddir
+
+# Install to system
+sudo meson install -C builddir
+
+# Restart fprintd daemon
+sudo systemctl restart fprintd
+```
+
+#### Option B: Build Native RPM Package
+```bash
+bash .github/scripts/build-rpm.sh
+sudo dnf install -y artifacts/*/*.rpm
+sudo systemctl restart fprintd
+```
+
+---
+
+### Arch Linux
+
+```bash
+cd packaging/arch
+makepkg -si
+sudo systemctl restart fprintd
+```
+
+---
+
+### Ubuntu / Debian
+
+```bash
+# Build native Debian package
+bash .github/scripts/build-deb.sh
+sudo dpkg -i artifacts/*/*.deb
+sudo systemctl restart fprintd
+```
+
+---
+
+## Enrolling & Verifying Fingerprints
+
+1. **Enroll your fingerprint** (supports multiple stages for high accuracy):
+   ```bash
+   fprintd-enroll "$USER" -f right-index-finger
+   ```
+   *Follow the terminal prompts, lifting and placing your finger on the sensor for each stage until completed.*
+
+2. **Verify your fingerprint**:
+   ```bash
+   fprintd-verify "$USER"
+   ```
+
+3. **Enable PAM Authentication (Optional)**:
+   On Fedora:
+   ```bash
+   sudo authselect enable-feature with-fingerprint
+   sudo authselect apply-changes
+   ```
+   Now `sudo`, lockscreen, and GDM login will prompt for fingerprint authentication.
+
+---
+
+## Troubleshooting & Verification
+
+- **Check daemon status**:
+  ```bash
+  systemctl status fprintd
+  ```
+
+- **Live debug logs**:
+  ```bash
+  G_MESSAGES_DEBUG=all sudo /usr/libexec/fprintd
+  ```
+
+- **Rollback to standard system library**:
+  * On Fedora: `sudo dnf reinstall -y libfprint`
+  * On Arch: `sudo pacman -S extra/libfprint`
+  * On Ubuntu: `sudo apt install --reinstall libfprint-2-2`
+  Then restart `fprintd`: `sudo systemctl restart fprintd`.
+
+---
 
 ## License
 
-`Section 6` of the license states that for compiled works that use
-this library, such works must include **LibFPrint** copyright notices
-alongside the copyright notices for the other parts of the work.
-
-**LibFPrint** includes code from **NIST's** **[NBIS]** software distribution.
-
-We include **Bozorth3** from the **[US Export Controlled]**
-distribution, which we have determined to be fine
-being shipped in an open source project.
-
-## Get in *touch*
-
- - [IRC] - `#fprint` @ `irc.oftc.net`
- - [Matrix] - `#fprint:matrix.org` bridged to the IRC channel
- - [MailingList] - low traffic, not much used these days
-
-<br/>
-
-<div align="right">
-
-[![Badge License]][License]
-
-</div>
-
-
-<!----------------------------------------------------------------------------->
-
-[Documentation]: https://fprint.freedesktop.org/libfprint-dev/
-[Contributors]: https://gitlab.freedesktop.org/libfprint/libfprint/-/graphs/master
-[Unsupported]: https://gitlab.freedesktop.org/libfprint/wiki/-/wikis/Unsupported-Devices
-[Supported]: https://fprint.freedesktop.org/supported-devices.html
-[Website]: https://fprint.freedesktop.org/
-[MailingList]: https://lists.freedesktop.org/mailman/listinfo/fprint
-[IRC]: ircs://irc.oftc.net:6697/#fprint
-[Matrix]: https://matrix.to/#/#fprint:matrix.org
-
-[Contribute]: ./HACKING.md
-[License]: ./COPYING
-
-[University Of Manchester]: https://www.manchester.ac.uk/
-[US Export Controlled]: https://fprint.freedesktop.org/us-export-control.html
-[NBIS]: http://fingerprint.nist.gov/NBIS/index.html
-
-
-<!---------------------------------[ Badges ]---------------------------------->
-
-[Badge License]: https://img.shields.io/badge/License-LGPL2.1-015d93.svg?style=for-the-badge&labelColor=blue
-
-
-<!---------------------------------[ Buttons ]--------------------------------->
-
-[Button Documentation]: https://img.shields.io/badge/Documentation-04ACE6?style=for-the-badge&logoColor=white&logo=BookStack
-[Button Contributors]: https://img.shields.io/badge/Contributors-FF4F8B?style=for-the-badge&logoColor=white&logo=ActiGraph
-[Button Unsupported]: https://img.shields.io/badge/Unsupported_Devices-EF2D5E?style=for-the-badge&logoColor=white&logo=AdBlock
-[Button Contribute]: https://img.shields.io/badge/Contribute-66459B?style=for-the-badge&logoColor=white&logo=Git
-[Button Supported]: https://img.shields.io/badge/Supported_Devices-428813?style=for-the-badge&logoColor=white&logo=AdGuard
-[Button Website]: https://img.shields.io/badge/Homepage-3B80AE?style=for-the-badge&logoColor=white&logo=freedesktopDotOrg
+This project is licensed under the [GNU Lesser General Public License v2.1 or later](./COPYING).
+Contains components from NIST NBIS and Bozorth3 under US export-controlled public research distributions.

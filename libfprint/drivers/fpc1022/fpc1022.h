@@ -1,7 +1,7 @@
 /*
- * FPC1022 (Match-on-Host) driver for libfprint
+ * FPC1022 driver for libfprint
  *
- * Supports FPC Disum USB fingerprint sensors (10a5:9200).
+ * Supports FPC USB fingerprint sensors (10a5:a920).
  *
  * Copyright (c) 2026 Sergey Subbotin <ssubbotin@gmail.com>
  *
@@ -30,7 +30,7 @@
 #include <openssl/evp.h>
 
 /* USB parameters */
-#define FPC1022_EP_IN (2 | FPI_USB_ENDPOINT_IN)              /* 0x82 */
+#define FPC1022_EP_IN (1 | FPI_USB_ENDPOINT_IN)              /* 0x81 */
 #define FPC1022_EP_IN_MAX_BUF_SIZE 2048
 #define FPC1022_CTRL_TIMEOUT 2000
 #define FPC1022_DATA_TIMEOUT 15000
@@ -41,9 +41,9 @@
 #define FPC1022_BULK_EVENT_MAX_SIZE (FPC1022_EVT_HDR_SIZE + FPC1022_TLS_RECORD_MAX_SIZE)
 #define FPC1022_BULK_ACCUM_SIZE (FPC1022_BULK_EVENT_MAX_SIZE + FPC1022_EP_IN_MAX_BUF_SIZE)
 
-/* Sensor image dimensions (FPC1022: 112x88, 1 byte per pixel) */
-#define FPC1022_IMG_WIDTH 112
-#define FPC1022_IMG_HEIGHT 88
+/* Sensor image dimensions (64x176, 1 byte per pixel) */
+#define FPC1022_IMG_WIDTH 64
+#define FPC1022_IMG_HEIGHT 176
 #define FPC1022_IMG_SIZE (FPC1022_IMG_WIDTH * FPC1022_IMG_HEIGHT)
 #define FPC1022_IMG_SCALE 2
 
@@ -59,7 +59,11 @@
 #define FPC1022_CMD_TLS_DATA 0x06
 #define FPC1022_CMD_INDICATE_S_STATE 0x08
 #define FPC1022_CMD_GET_IMG 0x09
+#define FPC1022_CMD_GET_DEAD_PIXELS 0x0A
 #define FPC1022_CMD_GET_TLS_KEY 0x0B
+#define FPC1022_CMD_GET_KPI 0x0C
+#define FPC1022_CMD_SET_TLS_KEY 0x0D
+#define FPC1022_CMD_GET_FW_VERSION 0x11
 #define FPC1022_CMD_FINGERPRINT_OFF 0x12
 #define FPC1022_CMD_GET_STATE 0x50
 
@@ -76,26 +80,19 @@
 
 /* TLS key packet magic */
 #define FPC1022_TLS_KEY_MAGIC 0x0DEC0DED
-
-/* Derived PSK size: SHA-256 output */
 #define FPC1022_TLS_PSK_SIZE 32
-
-/* AES-256-CBC block size, used to sanity-check the sealed key length */
 #define FPC1022_AES_BLOCK_SIZE 16
 
 /* S-state values */
 #define FPC1022_S_STATE_S0 0x0010
 
-/* Sensor init/arm/stop data (4-byte payloads for CMD_INIT and CMD_ARM) */
-#define FPC1022_INIT_DATA_SIZE 4
-#define FPC1022_ARM_OP_INIT 0x10
-#define FPC1022_ARM_OP_START 0x11
-#define FPC1022_ARM_OP_STOP 0x12
+/* Token base for 10a5:a920 */
+#define FPC1022_INIT_TOKEN_BASE 0x497f2970
 
-/* SIGFM matching threshold (minimum number of consistent geometric angle pairs) */
+/* SIGFM matching threshold */
 #define FPC1022_SCORE_THRESHOLD 10
 
-/* Event header (received on bulk IN endpoint) - network byte order */
+/* Event header (received on bulk IN endpoint) - little endian */
 typedef struct __attribute__((packed))
 {
   guint32 code;
@@ -121,6 +118,7 @@ typedef enum {
   FPC1022_OPEN_GET_STATE,
   FPC1022_OPEN_CMD_INIT,
   FPC1022_OPEN_WAIT_INIT_RESULT,
+  FPC1022_OPEN_SET_TLS_KEY,
   FPC1022_OPEN_GET_TLS_KEY,
   FPC1022_OPEN_TLS_INIT,
   FPC1022_OPEN_TLS_HANDSHAKE,
@@ -129,20 +127,20 @@ typedef enum {
 
 /* SSM states for image capture */
 typedef enum {
-  FPC1022_CAPTURE_STOP_ARM = 0,
-  FPC1022_CAPTURE_STOP_ABORT,
-  FPC1022_CAPTURE_STOP_SESSION_OFF,
-  FPC1022_CAPTURE_ARM_SENSOR,
+  FPC1022_CAPTURE_ARM_SENSOR = 0,
+  FPC1022_CAPTURE_WAIT_EVENT,
   FPC1022_CAPTURE_GET_IMAGE,
   FPC1022_CAPTURE_RECV_IMAGE,
+  FPC1022_CAPTURE_GET_FW_VERSION,
+  FPC1022_CAPTURE_GET_DEAD_PIXELS,
+  FPC1022_CAPTURE_GET_KPI,
+  FPC1022_CAPTURE_CONSUME_ACK,
   FPC1022_CAPTURE_NUM_STATES,
 } Fpc1022CaptureState;
 
 /* SSM states for deactivate */
 typedef enum {
-  FPC1022_DEACT_ARM_STOP = 0,
-  FPC1022_DEACT_ABORT,
-  FPC1022_DEACT_SESSION_OFF,
+  FPC1022_DEACT_ABORT = 0,
   FPC1022_DEACT_NUM_STATES,
 } Fpc1022DeactState;
 
@@ -159,14 +157,16 @@ struct _FpiDeviceFpc1022
   gsize  evt_total_len;
 
   /* TLS */
-  guint8   tls_psk[FPC1022_TLS_PSK_SIZE];
-  gsize    tls_psk_len;
-  SSL_CTX *ssl_ctx;
-  SSL     *ssl;
-  BIO     *bio_in;       /* we write device data here, SSL reads from it */
-  BIO     *bio_out;      /* SSL writes here, we read and send to device */
-  gboolean tls_established;
+  guint8      tls_psk[FPC1022_TLS_PSK_SIZE];
+  SSL_CTX    *ssl_ctx;
+  SSL        *ssl;
+  BIO        *bio_in;
+  BIO        *bio_out;
+  gboolean    tls_established;
   GByteArray *tls_rx_buf;
+
+  /* Arming token counter */
+  guint32 arm_token;
 
   /* State */
   FpiSsm       *open_ssm;

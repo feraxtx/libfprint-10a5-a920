@@ -323,6 +323,12 @@ if 'virtual_image' in drivers
     ]
 endif
 
+if 'fpc1022' in drivers
+    unit_tests += [
+        'fpc1022-kdf',
+    ]
+endif
+
 unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
 
 foreach test_name: unit_tests

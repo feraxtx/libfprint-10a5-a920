@@ -1,3 +1,10 @@
 *.o
 *.swp
 _build
+builddir/
+recordings/
+scratch/
+*.pgm
+*.pcapng
+__pycache__/
+*.pyc

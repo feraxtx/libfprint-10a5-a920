@@ -1,9 +1,7 @@
 /*
- * FPC1022 (Match-on-Host) driver for libfprint
+ * FPC1022 driver for libfprint
  *
- * Supports FPC Disum USB fingerprint sensors (10a5:9200).
- * These are "match on host" sensors: they capture raw fingerprint images
- * over a TLS-PSK encrypted USB channel and rely on the host for matching.
+ * Supports FPC USB fingerprint sensors (10a5:a920).
  *
  * Copyright (c) 2026 Sergey Subbotin <ssubbotin@gmail.com>
  *
@@ -26,16 +24,33 @@
 #include "fpc1022.h"
 #include "fpi-image.h"
 
-#include <openssl/sha.h>
-#include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/core_names.h>
 
 #define FP_COMPONENT "fpc1022"
 
 G_DEFINE_TYPE (FpiDeviceFpc1022, fpi_device_fpc1022, FP_TYPE_IMAGE_DEVICE);
 
-/* Nearest-neighbor 2x upscale — gives SIGFM more pixels for keypoint detection
- * on this small sensor (112x88 → 224x176). */
+static const FpIdEntry id_table[] = {
+  { .vid = 0x10A5, .pid = 0xA920 },
+  { .vid = 0,      .pid = 0      },
+};
+
+/* Sealed TLS key packet sent to device (CMD_SET_TLS_KEY, 119 bytes) */
+static const guint8 fpc1022_sealed_key_pkt[119] = {
+  0xed, 0x0d, 0xec, 0x0d, 0x1c, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+  0x4c, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x57, 0x00, 0x00, 0x00,
+  0x20, 0x00, 0x00, 0x00, 0xbd, 0xda, 0x29, 0xfc, 0xc0, 0x64, 0x48, 0xd1,
+  0xca, 0x5a, 0xe7, 0xe1, 0x27, 0x7b, 0x65, 0xc6, 0x96, 0x76, 0xaa, 0xe4,
+  0xfe, 0xca, 0xfa, 0x26, 0xba, 0xce, 0xbe, 0x80, 0x2b, 0xc8, 0xd6, 0x8d,
+  0x6c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x46, 0x50, 0x43, 0x5f, 0x4b, 0x45, 0x59, 0x5f,
+  0x41, 0x41, 0x44, 0x6b, 0x48, 0x1b, 0xcd, 0x57, 0xb6, 0x32, 0x33, 0xb0,
+  0xca, 0xaa, 0xf2, 0x54, 0x4a, 0x9b, 0x10, 0x20, 0xcb, 0xe1, 0xcb, 0x93,
+  0x40, 0x74, 0x4c, 0x4a, 0x98, 0x09, 0xab, 0x64, 0xc6, 0x31, 0xf5
+};
+
+/* Nearest-neighbor 2x upscale: 64x176 -> 128x352 */
 static FpImage *
 fpc1022_scale_nn_2x (FpImage *src)
 {
@@ -53,64 +68,29 @@ fpc1022_scale_nn_2x (FpImage *src)
   return dst;
 }
 
-static const FpIdEntry id_table[] = {
-  { .vid = 0x10A5, .pid = 0x9200 },
-  { .vid = 0,      .pid = 0      },
-};
+/* ---- Cryptographic Helpers ---- */
 
-/* ---- Crypto helpers ---- */
-
-static gboolean
+static int
 fpc1022_sha256 (const void *data, gsize len, guint8 *out)
 {
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new ();
-  unsigned int olen = 0;
-  gboolean success = FALSE;
-
-  if (!ctx)
-    return FALSE;
-
-  if (!EVP_DigestInit_ex (ctx, EVP_sha256 (), NULL) ||
-      !EVP_DigestUpdate (ctx, data, len) ||
-      !EVP_DigestFinal_ex (ctx, out, &olen) ||
-      olen != SHA256_DIGEST_LENGTH)
-    goto out;
-
-  success = TRUE;
-
-out:
-  EVP_MD_CTX_free (ctx);
-  return success;
+  unsigned int out_len = 0;
+  return EVP_Digest (data, len, out, &out_len, EVP_sha256 (), NULL) && out_len == 32;
 }
 
-static gboolean
-fpc1022_verify_tls_key_hmac (const guint8 *aad, gsize aad_len,
-                             const guint8 *key, gsize key_len,
-                             const guint8 *sig, gsize sig_len)
+static int
+fpc1022_hmac_sha256 (const guint8 *key, gsize key_len,
+                     const guint8 *data, gsize data_len,
+                     guint8 *out)
 {
-  guint8 hmac_key[SHA256_DIGEST_LENGTH];
-  guint8 computed_sig[SHA256_DIGEST_LENGTH];
-  EVP_MAC *mac;
-  EVP_MAC_CTX *mctx;
-  gboolean valid = FALSE;
-  size_t out_len = sizeof (computed_sig);
-
-  if (sig_len != SHA256_DIGEST_LENGTH)
-    return FALSE;
-
-  /* HMAC key = SHA256("FPC_HMAC_KEY") - 13 bytes including null terminator */
-  if (!fpc1022_sha256 ("FPC_HMAC_KEY", 13, hmac_key))
-    return FALSE;
-
-  mac = EVP_MAC_fetch (NULL, "HMAC", NULL);
+  EVP_MAC *mac = EVP_MAC_fetch (NULL, "HMAC", NULL);
   if (!mac)
-    return FALSE;
+    return 0;
 
-  mctx = EVP_MAC_CTX_new (mac);
-  if (!mctx)
+  EVP_MAC_CTX *ctx = EVP_MAC_CTX_new (mac);
+  if (!ctx)
     {
       EVP_MAC_free (mac);
-      return FALSE;
+      return 0;
     }
 
   char digest_name[] = "SHA256";
@@ -119,115 +99,238 @@ fpc1022_verify_tls_key_hmac (const guint8 *aad, gsize aad_len,
     OSSL_PARAM_construct_end ()
   };
 
-  if (!EVP_MAC_init (mctx, hmac_key, SHA256_DIGEST_LENGTH, params) ||
-      !EVP_MAC_update (mctx, aad, aad_len) ||
-      !EVP_MAC_update (mctx, key, key_len) ||
-      !EVP_MAC_final (mctx, computed_sig, &out_len, sizeof (computed_sig)) ||
-      out_len != SHA256_DIGEST_LENGTH)
-    goto out;
+  size_t out_len = 32;
+  int ok = EVP_MAC_init (ctx, key, key_len, params) &&
+           EVP_MAC_update (ctx, data, data_len) &&
+           EVP_MAC_final (ctx, out, &out_len, 32) &&
+           out_len == 32;
 
-  valid = CRYPTO_memcmp (computed_sig, sig, SHA256_DIGEST_LENGTH) == 0;
-
-out:
-  EVP_MAC_CTX_free (mctx);
+  EVP_MAC_CTX_free (ctx);
   EVP_MAC_free (mac);
-
-  return valid;
+  return ok;
 }
 
+/* Parse sealed key packet, verify HMAC signature, and decrypt AES-256-CBC PSK */
 static gboolean
-fpc1022_decrypt_tls_psk (const guint8 *encrypted, gsize enc_len,
-                         guint8 *psk_out, gsize psk_out_size, gsize *psk_len_out)
+fpc1022_process_tls_key_packet (FpiDeviceFpc1022 *self,
+                                const guint8 *data,
+                                gsize data_len)
 {
-  guint8 sealing_key[SHA256_DIGEST_LENGTH];
-  guint8 plain[FPC1022_TLS_PSK_SIZE + EVP_MAX_BLOCK_LENGTH];
-  EVP_CIPHER_CTX *ctx;
-  gsize total_out = 0;
-  int out_len = 0;
+  guint32 magic, key_offset, key_len, aad_offset, aad_len, sig_offset, sig_len;
+  guint8 kdf_key[32];
+  guint8 msg1[4 + 17 + 4];
+  guint8 msg2[4 + 17 + 4];
+  guint8 hmac_key[32];
+  guint8 aes_key[32];
+  guint8 iv_in[3 + 4];
+  guint8 iv_full[32];
+  guint8 sig_msg[13 + 32 + 11];
+  guint8 comp_sig[32];
+  EVP_CIPHER_CTX *ctx = NULL;
+  int out_len = 0, final_len = 0;
+  gboolean ok = FALSE;
 
-  /* enc_len is attacker-controlled: it comes straight out of the key packet
-   * the device sends. AES-256-CBC with padding disabled yields exactly enc_len
-   * bytes, so reject anything that would not fit instead of decrypting first
-   * and clamping afterwards. */
-  if (enc_len == 0 || enc_len > psk_out_size ||
-      enc_len > sizeof (plain) ||
-      enc_len % FPC1022_AES_BLOCK_SIZE != 0)
+  if (data_len < sizeof (Fpc1022TlsKeyPkt))
     {
-      fp_err ("TLS key blob has implausible length %" G_GSIZE_FORMAT, enc_len);
+      fp_err ("TLS key packet too short: %" G_GSIZE_FORMAT, data_len);
       return FALSE;
     }
 
-  /* Sealing key = SHA256("FPC_SEALING_KEY") - 16 bytes including null terminator */
-  if (!fpc1022_sha256 ("FPC_SEALING_KEY", 16, sealing_key))
+  Fpc1022TlsKeyPkt *pkt = (Fpc1022TlsKeyPkt *) data;
+  magic = GUINT32_FROM_LE (pkt->magic);
+  key_offset = GUINT32_FROM_LE (pkt->key_offset);
+  key_len = GUINT32_FROM_LE (pkt->key_len);
+  aad_offset = GUINT32_FROM_LE (pkt->aad_offset);
+  aad_len = GUINT32_FROM_LE (pkt->aad_len);
+  sig_offset = GUINT32_FROM_LE (pkt->sig_offset);
+  sig_len = GUINT32_FROM_LE (pkt->sig_len);
+
+  if (magic != FPC1022_TLS_KEY_MAGIC)
+    {
+      fp_err ("TLS key packet invalid magic: 0x%08x", magic);
+      return FALSE;
+    }
+
+  if (aad_offset > data_len || aad_len > data_len - aad_offset ||
+      key_offset > data_len || key_len > data_len - key_offset ||
+      sig_offset > data_len || sig_len > data_len - sig_offset ||
+      key_len != 32 || sig_len != 32 || aad_len != 11)
+    {
+      fp_err ("TLS key packet bounds error");
+      return FALSE;
+    }
+
+  if (memcmp (data + aad_offset, "FPC_KEY_AAD", 11) != 0)
+    {
+      fp_err ("TLS key packet unexpected AAD");
+      return FALSE;
+    }
+
+  /* KDF key = SHA256("FPC_SEALING_KEY\0") */
+  if (!fpc1022_sha256 ("FPC_SEALING_KEY", 16, kdf_key))
     return FALSE;
 
+  /* NIST SP 800-108 Counter Mode KDF */
+  msg1[0] = 0; msg1[1] = 0; msg1[2] = 0; msg1[3] = 1;
+  memcpy (msg1 + 4, "application keys", 17);
+  msg1[21] = 0; msg1[22] = 0; msg1[23] = 2; msg1[24] = 0; /* 512 bits */
+  if (!fpc1022_hmac_sha256 (kdf_key, 32, msg1, sizeof (msg1), hmac_key))
+    return FALSE;
+
+  msg2[0] = 0; msg2[1] = 0; msg2[2] = 0; msg2[3] = 2;
+  memcpy (msg2 + 4, "application keys", 17);
+  msg2[21] = 0; msg2[22] = 0; msg2[23] = 2; msg2[24] = 0;
+  if (!fpc1022_hmac_sha256 (kdf_key, 32, msg2, sizeof (msg2), aes_key))
+    return FALSE;
+
+  /* Verify HMAC signature: HMAC_SHA256(hmac_key, "FPC_HMAC_KEY\0" || key || aad) */
+  memcpy (sig_msg, "FPC_HMAC_KEY", 13);
+  memcpy (sig_msg + 13, data + key_offset, 32);
+  memcpy (sig_msg + 13 + 32, data + aad_offset, 11);
+  if (!fpc1022_hmac_sha256 (hmac_key, 32, sig_msg, sizeof (sig_msg), comp_sig))
+    return FALSE;
+
+  if (CRYPTO_memcmp (comp_sig, data + sig_offset, 32) != 0)
+    {
+      fp_err ("TLS key signature verification failed");
+      return FALSE;
+    }
+
+  /* Derive IV: HMAC_SHA256(hmac_key, "iv\0" || 0x2020f00d)[:16] */
+  memcpy (iv_in, "iv", 3);
+  iv_in[3] = 0x20; iv_in[4] = 0x20; iv_in[5] = 0xf0; iv_in[6] = 0x0d;
+  if (!fpc1022_hmac_sha256 (hmac_key, 32, iv_in, sizeof (iv_in), iv_full))
+    return FALSE;
+
+  /* Decrypt sealed key with AES-256-CBC */
   ctx = EVP_CIPHER_CTX_new ();
   if (!ctx)
     return FALSE;
 
-  /* Use EVP_CipherInit with NULL IV (zero IV) and direction=0 (decrypt),
-   * matching the reference implementation exactly. */
-  if (!EVP_CipherInit (ctx, EVP_aes_256_cbc (), sealing_key, NULL, 0))
+  if (EVP_CipherInit_ex (ctx, EVP_aes_256_cbc (), NULL, aes_key, iv_full, 0) &&
+      EVP_CIPHER_CTX_set_padding (ctx, 0) &&
+      EVP_CipherUpdate (ctx, self->tls_psk, &out_len, data + key_offset, 32) &&
+      EVP_CipherFinal_ex (ctx, self->tls_psk + out_len, &final_len))
     {
-      EVP_CIPHER_CTX_free (ctx);
-      return FALSE;
+      ok = TRUE;
+      fp_dbg ("Successfully derived and decrypted TLS PSK (%d bytes)", out_len + final_len);
     }
-
-  /* Disable PKCS7 padding — the encrypted key may not be padded.
-   * Must be called AFTER CipherInit so the context is fully set up. */
-  if (!EVP_CIPHER_CTX_set_padding (ctx, 0))
+  else
     {
-      EVP_CIPHER_CTX_free (ctx);
-      return FALSE;
+      fp_err ("AES-256-CBC decryption failed");
     }
-
-  out_len = 0;
-  if (!EVP_CipherUpdate (ctx, plain, &out_len, encrypted, enc_len))
-    {
-      EVP_CIPHER_CTX_free (ctx);
-      return FALSE;
-    }
-  total_out = out_len;
-
-  out_len = 0;
-  if (!EVP_CipherFinal (ctx, plain + total_out, &out_len))
-    {
-      EVP_CIPHER_CTX_free (ctx);
-      return FALSE;
-    }
-  total_out += out_len;
 
   EVP_CIPHER_CTX_free (ctx);
 
-  if (total_out > psk_out_size)
+  /* Securely wipe temporary cryptographic key material from stack */
+  OPENSSL_cleanse (kdf_key, sizeof (kdf_key));
+  OPENSSL_cleanse (msg1, sizeof (msg1));
+  OPENSSL_cleanse (msg2, sizeof (msg2));
+  OPENSSL_cleanse (hmac_key, sizeof (hmac_key));
+  OPENSSL_cleanse (aes_key, sizeof (aes_key));
+  OPENSSL_cleanse (iv_in, sizeof (iv_in));
+  OPENSSL_cleanse (iv_full, sizeof (iv_full));
+  OPENSSL_cleanse (sig_msg, sizeof (sig_msg));
+  OPENSSL_cleanse (comp_sig, sizeof (comp_sig));
+
+  return ok;
+}
+
+/* OpenSSL PSK client callback returning "Disum PSK" identity and key */
+static unsigned int
+fpc1022_psk_client_cb (SSL *ssl,
+                       const char *hint,
+                       char *identity,
+                       unsigned int max_identity_len,
+                       unsigned char *psk,
+                       unsigned int max_psk_len)
+{
+  FpiDeviceFpc1022 *self = SSL_get_app_data (ssl);
+  const char *id = "Disum PSK";
+
+  fp_dbg ("PSK client callback invoked (hint: %s)", hint ? hint : "(null)");
+
+  g_strlcpy (identity, id, max_identity_len);
+  if (sizeof (self->tls_psk) > max_psk_len)
     {
-      fp_err ("decrypted TLS key is %" G_GSIZE_FORMAT " bytes, expected at most %"
-              G_GSIZE_FORMAT, total_out, psk_out_size);
+      fp_err ("max_psk_len (%u) too small for PSK", max_psk_len);
+      return 0;
+    }
+
+  memcpy (psk, self->tls_psk, sizeof (self->tls_psk));
+  return sizeof (self->tls_psk);
+}
+
+/* Set up TLS client context using TLS 1.2 PSK */
+static gboolean
+fpc1022_init_tls_client (FpiDeviceFpc1022 *self)
+{
+  if (self->ssl)
+    {
+      SSL_free (self->ssl);
+      self->ssl = NULL;
+      self->bio_in = NULL;
+      self->bio_out = NULL;
+    }
+  if (self->ssl_ctx)
+    {
+      SSL_CTX_free (self->ssl_ctx);
+      self->ssl_ctx = NULL;
+    }
+
+  self->ssl_ctx = SSL_CTX_new (TLS_client_method ());
+  if (!self->ssl_ctx)
+    {
+      fp_err ("Failed to create SSL_CTX");
       return FALSE;
     }
 
-  memcpy (psk_out, plain, total_out);
-  *psk_len_out = total_out;
-  fp_dbg ("PSK decrypted: %" G_GSIZE_FORMAT " bytes from %" G_GSIZE_FORMAT " encrypted", *psk_len_out, enc_len);
+  SSL_CTX_set_min_proto_version (self->ssl_ctx, TLS1_2_VERSION);
+  SSL_CTX_set_max_proto_version (self->ssl_ctx, TLS1_2_VERSION);
+  SSL_CTX_set_options (self->ssl_ctx, SSL_OP_NO_COMPRESSION);
+
+  if (!SSL_CTX_set_cipher_list (self->ssl_ctx,
+                                "PSK-AES128-GCM-SHA256:PSK-AES256-GCM-SHA384:PSK-AES128-CBC-SHA256"))
+    {
+      fp_err ("Failed to set TLS cipher list");
+      return FALSE;
+    }
+
+  SSL_CTX_set_psk_client_callback (self->ssl_ctx, fpc1022_psk_client_cb);
+
+  self->bio_in = BIO_new (BIO_s_mem ());
+  self->bio_out = BIO_new (BIO_s_mem ());
+  if (!self->bio_in || !self->bio_out)
+    {
+      fp_err ("Failed to create memory BIOs");
+      if (self->bio_in)
+        BIO_free (self->bio_in);
+      if (self->bio_out)
+        BIO_free (self->bio_out);
+      self->bio_in = NULL;
+      self->bio_out = NULL;
+      return FALSE;
+    }
+
+  self->ssl = SSL_new (self->ssl_ctx);
+  if (!self->ssl)
+    {
+      fp_err ("Failed to create SSL instance");
+      BIO_free (self->bio_in);
+      BIO_free (self->bio_out);
+      self->bio_in = NULL;
+      self->bio_out = NULL;
+      return FALSE;
+    }
+
+  SSL_set_app_data (self->ssl, self);
+  SSL_set_bio (self->ssl, self->bio_in, self->bio_out);
+  SSL_set_connect_state (self->ssl);
+
   return TRUE;
 }
 
-/* ---- TLS-PSK callback ---- */
-
-static unsigned int
-fpc1022_psk_server_cb (SSL *ssl, const char *identity,
-                       unsigned char *psk, unsigned int max_psk_len)
-{
-  FpiDeviceFpc1022 *self = SSL_get_app_data (ssl);
-
-  if (self->tls_psk_len == 0 || self->tls_psk_len > max_psk_len)
-    return 0;
-
-  memcpy (psk, self->tls_psk, self->tls_psk_len);
-  return self->tls_psk_len;
-}
-
-/* ---- USB control transfer helpers ---- */
+/* ---- USB Control and Bulk Helpers ---- */
 
 static GCancellable *
 fpc1022_get_transfer_cancellable (FpiDeviceFpc1022 *self, FpiSsm *ssm)
@@ -251,31 +354,17 @@ fpc1022_ctrl_cmd_cb (FpiUsbTransfer *transfer, FpDevice *dev,
   fpi_ssm_next_state (transfer->ssm);
 }
 
-/* Like fpc1022_ctrl_cmd_cb but ignores errors (for deactivation commands
- * that may stall if no session is active). */
 static void
 fpc1022_ctrl_cmd_ignore_error_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                                   gpointer user_data, GError *error)
 {
   if (error)
     {
-      fp_dbg ("Ignoring control transfer error: %s", error->message);
+      fp_dbg ("Ignoring non-critical control error: %s", error->message);
       g_error_free (error);
     }
 
   fpi_ssm_next_state (transfer->ssm);
-}
-
-/* Fire-and-forget callback: just log errors, don't touch SSM. */
-static void
-fpc1022_ctrl_cmd_noop_cb (FpiUsbTransfer *transfer, FpDevice *dev,
-                          gpointer user_data, GError *error)
-{
-  if (error)
-    {
-      fp_dbg ("Fire-and-forget ctrl error: %s", error->message);
-      g_error_free (error);
-    }
 }
 
 static void
@@ -311,17 +400,6 @@ fpc1022_send_ctrl (FpDevice *dev, FpiSsm *ssm,
                           fpc1022_ctrl_cmd_cb);
 }
 
-/* ---- Bulk event reception helper ---- */
-
-static void fpc1022_capture_bulk_cb (FpiUsbTransfer *transfer,
-                                     FpDevice       *dev,
-                                     gpointer        user_data,
-                                     GError         *error);
-static void fpc1022_tls_handshake_flush_cb (FpiUsbTransfer *transfer,
-                                            FpDevice       *dev,
-                                            gpointer        user_data,
-                                            GError         *error);
-
 static void
 fpc1022_submit_bulk_read (FpDevice *dev, FpiSsm *ssm,
                           FpiUsbTransferCallback callback,
@@ -337,51 +415,25 @@ fpc1022_submit_bulk_read (FpDevice *dev, FpiSsm *ssm,
                            callback, NULL);
 }
 
-/* ---- TLS data exchange helpers ---- */
-
-/* Feed data received from device bulk IN (ev_tls payload) into SSL BIO input */
-static gboolean
-fpc1022_tls_feed_input (FpiDeviceFpc1022 *self,
-                        const guint8 *data, gsize len)
-{
-  int written;
-
-  if (len == 0)
-    return TRUE;
-  if (len > G_MAXINT)
-    return FALSE;
-
-  written = BIO_write (self->bio_in, data, (int) len);
-  return written >= 0 && (gsize) written == len;
-}
-
-/* ---- Bulk event accumulation ----
- *
- * Events from the device may span multiple USB bulk transfers (max 64 bytes).
- * The event header's `len` field (big-endian) gives the total event size.
- * We accumulate into self->bulk_buf until we have the full event.
- */
-
-static void fpc1022_process_event (FpDevice *dev, FpiSsm *ssm);
-static void fpc1022_open_continue (FpDevice *dev, FpiSsm *ssm);
-
 static gboolean
 fpc1022_prepare_bulk_event (FpiDeviceFpc1022 *self,
-                            FpiSsm            *ssm,
-                            gboolean          *complete)
+                            FpiSsm *ssm,
+                            gboolean *complete)
 {
   guint32 event_len;
 
-  *complete = FALSE;
   if (self->bulk_recv_len < sizeof (Fpc1022EvtHdr))
-    return TRUE;
+    {
+      *complete = FALSE;
+      return TRUE;
+    }
 
   if (self->evt_total_len == 0)
     {
       memcpy (&event_len,
               self->bulk_buf + G_STRUCT_OFFSET (Fpc1022EvtHdr, len),
               sizeof (event_len));
-      self->evt_total_len = GUINT32_FROM_BE (event_len);
+      self->evt_total_len = GUINT32_FROM_LE (event_len);
 
       if (self->evt_total_len < sizeof (Fpc1022EvtHdr) ||
           self->evt_total_len > FPC1022_BULK_EVENT_MAX_SIZE)
@@ -413,192 +465,12 @@ fpc1022_consume_bulk_event (FpiDeviceFpc1022 *self)
   self->evt_total_len = 0;
 }
 
-static void
-fpc1022_open_bulk_cb (FpiUsbTransfer *transfer, FpDevice *dev,
-                      gpointer user_data, GError *error)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+/* ---- Open SSM Implementation ---- */
 
-  if (error)
-    {
-      fpi_ssm_mark_failed (transfer->ssm, error);
-      return;
-    }
+static void fpc1022_tls_handshake_step (FpDevice *dev, FpiSsm *ssm);
+static void fpc1022_open_wait_init_continue (FpDevice *dev, FpiSsm *ssm);
+static void fpc1022_open_bulk_read_continue (FpDevice *dev, FpiSsm *ssm);
 
-  /* Accumulate data into bulk_buf */
-  if (self->bulk_recv_len + transfer->actual_length > sizeof (self->bulk_buf))
-    {
-      fp_err ("Bulk buffer overflow");
-      self->bulk_recv_len = 0;
-      self->evt_total_len = 0;
-      fpi_ssm_mark_failed (transfer->ssm,
-                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-      return;
-    }
-
-  memcpy (self->bulk_buf + self->bulk_recv_len,
-          transfer->buffer, transfer->actual_length);
-  self->bulk_recv_len += transfer->actual_length;
-
-  fpc1022_open_continue (dev, transfer->ssm);
-}
-
-static void
-fpc1022_open_continue (FpDevice *dev, FpiSsm *ssm)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
-  gboolean complete;
-
-  if (!fpc1022_prepare_bulk_event (self, ssm, &complete))
-    return;
-
-  if (complete)
-    fpc1022_process_event (dev, ssm);
-  else
-    fpc1022_submit_bulk_read (dev, ssm, fpc1022_open_bulk_cb,
-                              FPC1022_DATA_TIMEOUT);
-}
-
-static gboolean
-fpc1022_flush_handshake_packet (FpDevice *dev, FpiSsm *ssm)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
-  int pending = BIO_ctrl_pending (self->bio_out);
-
-  if (pending > 0)
-    {
-      guint8 buf[FPC1022_BULK_MAX_PKT];
-      int n = BIO_read (self->bio_out, buf, MIN (pending, FPC1022_BULK_MAX_PKT));
-
-      if (n > 0)
-        {
-          FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
-
-          fpi_usb_transfer_fill_control (t,
-                                         G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
-                                         G_USB_DEVICE_REQUEST_TYPE_VENDOR,
-                                         G_USB_DEVICE_RECIPIENT_DEVICE,
-                                         FPC1022_CMD_TLS_DATA, 0x0001, 0, n);
-          memcpy (t->buffer, buf, n);
-          t->ssm = ssm;
-          fpi_usb_transfer_submit (t, FPC1022_CTRL_TIMEOUT,
-                                   fpc1022_get_transfer_cancellable (self, ssm),
-                                   fpc1022_tls_handshake_flush_cb, NULL);
-          return TRUE;
-        }
-    }
-
-  return FALSE;
-}
-
-/* Try to advance TLS handshake: flush output then read more */
-static void
-fpc1022_tls_handshake_step (FpDevice *dev, FpiSsm *ssm)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
-
-  int ret = SSL_do_handshake (self->ssl);
-
-  if (ret == 1)
-    {
-      const SSL_CIPHER *cipher = SSL_get_current_cipher (self->ssl);
-      fp_dbg ("TLS handshake completed! cipher=%s version=%s",
-              cipher ? SSL_CIPHER_get_name (cipher) : "unknown",
-              SSL_get_version (self->ssl));
-      self->tls_established = TRUE;
-
-      /* CRITICAL: Flush any remaining TLS handshake data (e.g. Finished)
-       * to the device before proceeding. Without this, the sensor never
-       * receives our final handshake messages and doesn't consider TLS
-       * established, causing a reset on subsequent commands. */
-      if (fpc1022_flush_handshake_packet (dev, ssm))
-        return;
-
-      fpi_ssm_next_state (ssm);
-      return;
-    }
-
-  int ssl_err = SSL_get_error (self->ssl, ret);
-
-  if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
-    {
-      /* Flush any pending output first */
-      if (fpc1022_flush_handshake_packet (dev, ssm))
-        return;
-
-      /* Need data from device */
-      fpc1022_open_continue (dev, ssm);
-      return;
-    }
-
-  fp_err ("TLS handshake error: ssl_err=%d: %s", ssl_err,
-          ERR_error_string (ERR_get_error (), NULL));
-  fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-}
-
-/* Process a fully received bulk event */
-static void
-fpc1022_process_event (FpDevice *dev, FpiSsm *ssm)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
-  Fpc1022EvtHdr *hdr = (Fpc1022EvtHdr *) self->bulk_buf;
-  guint32 code = GUINT32_FROM_BE (hdr->code);
-  guint32 len = GUINT32_FROM_BE (hdr->len);
-  int ssm_state = fpi_ssm_get_cur_state (ssm);
-
-  fp_dbg ("%s event code=0x%02x len=%u state=%d",
-          G_STRFUNC, code, len, ssm_state);
-
-  gsize event_len = self->evt_total_len;
-
-  switch (ssm_state)
-    {
-    case FPC1022_OPEN_WAIT_INIT_RESULT:
-      if (code == FPC1022_EVT_INIT_RESULT)
-        {
-          fp_dbg ("Got init result, proceeding to TLS key retrieval");
-          fpc1022_consume_bulk_event (self);
-          fpi_ssm_next_state (ssm);
-          return;
-        }
-      fpc1022_consume_bulk_event (self);
-      fpc1022_open_continue (dev, ssm);
-      return;
-
-    case FPC1022_OPEN_TLS_HANDSHAKE:
-      if (code == FPC1022_EVT_TLS)
-        {
-          /* Feed TLS payload (after event header) into SSL BIO */
-          gsize payload_off = sizeof (Fpc1022EvtHdr);
-
-          if (event_len > payload_off &&
-              !fpc1022_tls_feed_input (self,
-                                       self->bulk_buf + payload_off,
-                                       event_len - payload_off))
-            {
-              fpi_ssm_mark_failed (ssm,
-                                   fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-              return;
-            }
-
-          fpc1022_consume_bulk_event (self);
-          fpc1022_tls_handshake_step (dev, ssm);
-          return;
-        }
-      fp_dbg ("Ignoring event 0x%02x during TLS handshake", code);
-      fpc1022_consume_bulk_event (self);
-      fpc1022_open_continue (dev, ssm);
-      return;
-
-    default:
-      fp_dbg ("Unexpected event 0x%02x in state %d", code, ssm_state);
-      fpc1022_consume_bulk_event (self);
-      fpc1022_open_continue (dev, ssm);
-      return;
-    }
-}
-
-/* Callback for the GET_STATE control transfer */
 static void
 fpc1022_open_get_state_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                            gpointer user_data, GError *error)
@@ -609,17 +481,11 @@ fpc1022_open_get_state_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       return;
     }
 
-  if (transfer->actual_length >= 4)
-    {
-      fp_dbg ("FPC firmware version: %d.%d.%d.%d",
-              transfer->buffer[0], transfer->buffer[1],
-              transfer->buffer[2], transfer->buffer[3]);
-    }
-
+  fp_dbg ("Received GET_STATE response (%" G_GSSIZE_FORMAT " bytes)",
+          transfer->actual_length);
   fpi_ssm_next_state (transfer->ssm);
 }
 
-/* Callback for the GET_TLS_KEY control transfer */
 static void
 fpc1022_open_get_tls_key_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                              gpointer user_data, GError *error)
@@ -632,103 +498,191 @@ fpc1022_open_get_tls_key_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       return;
     }
 
-  /* The control response buffer starts after the setup packet (8 bytes) for
-   * control transfers created with fpi_usb_transfer_fill_control.
-   * But libfprint's fill_control puts the response directly in transfer->buffer. */
-  guint8 *data = transfer->buffer;
-  gsize data_len = transfer->actual_length;
-  guint32 magic;
-  guint32 key_offset;
-  guint32 key_len;
-  guint32 aad_offset;
-  guint32 aad_len;
-  guint32 sig_offset;
-  guint32 sig_len;
-
-  fp_dbg ("%s received TLS key packet, %" G_GSIZE_FORMAT " bytes", G_STRFUNC, data_len);
-
-  if (data_len < sizeof (Fpc1022TlsKeyPkt))
+  if (!fpc1022_process_tls_key_packet (self, transfer->buffer, transfer->actual_length))
     {
-      fp_err ("TLS key packet too short: %" G_GSIZE_FORMAT, data_len);
       fpi_ssm_mark_failed (transfer->ssm,
                            fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
       return;
     }
-
-  Fpc1022TlsKeyPkt *pkt = (Fpc1022TlsKeyPkt *) data;
-
-  magic = GUINT32_FROM_LE (pkt->magic);
-  key_offset = GUINT32_FROM_LE (pkt->key_offset);
-  key_len = GUINT32_FROM_LE (pkt->key_len);
-  aad_offset = GUINT32_FROM_LE (pkt->aad_offset);
-  aad_len = GUINT32_FROM_LE (pkt->aad_len);
-  sig_offset = GUINT32_FROM_LE (pkt->sig_offset);
-  sig_len = GUINT32_FROM_LE (pkt->sig_len);
-
-  if (magic != FPC1022_TLS_KEY_MAGIC)
-    {
-      fp_err ("TLS key packet bad magic: 0x%08x (expected 0x%08x)",
-              magic, FPC1022_TLS_KEY_MAGIC);
-      fpi_ssm_mark_failed (transfer->ssm,
-                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-      return;
-    }
-
-  /* All offsets in the packet are relative to the start of the packet.
-   * Compare each length against the space remaining after its offset: adding
-   * offset and length first would let a hostile packet wrap guint32 and slip
-   * past the check. */
-  if (aad_offset > data_len || aad_len > data_len - aad_offset ||
-      key_offset > data_len || key_len > data_len - key_offset ||
-      sig_offset > data_len || sig_len > data_len - sig_offset)
-    {
-      fp_err ("TLS key packet fields out of bounds (aad=%u+%u, key=%u+%u, sig=%u+%u, total=%" G_GSIZE_FORMAT ")",
-              aad_offset, aad_len, key_offset, key_len,
-              sig_offset, sig_len, data_len);
-      fpi_ssm_mark_failed (transfer->ssm,
-                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-      return;
-    }
-
-  /* Verify AAD is "FPC TLS Keys" */
-  if (aad_len != sizeof ("FPC TLS Keys") ||
-      memcmp ("FPC TLS Keys", data + aad_offset, aad_len) != 0)
-    {
-      fp_err ("TLS key packet bad AAD");
-      fpi_ssm_mark_failed (transfer->ssm,
-                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-      return;
-    }
-
-  /* Verify HMAC signature */
-  if (!fpc1022_verify_tls_key_hmac (data + aad_offset, aad_len,
-                                    data + key_offset, key_len,
-                                    data + sig_offset, sig_len))
-    {
-      fp_err ("TLS key HMAC verification failed");
-      fpi_ssm_mark_failed (transfer->ssm,
-                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-      return;
-    }
-
-  fp_dbg ("TLS key HMAC verified OK");
-
-  /* Decrypt PSK */
-  gsize psk_len = 0;
-
-  if (!fpc1022_decrypt_tls_psk (data + key_offset, key_len,
-                                 self->tls_psk, sizeof (self->tls_psk), &psk_len))
-    {
-      fp_err ("TLS PSK decryption failed");
-      fpi_ssm_mark_failed (transfer->ssm,
-                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-      return;
-    }
-
-  self->tls_psk_len = psk_len;
-  fp_dbg ("TLS PSK decrypted, %" G_GSIZE_FORMAT " bytes", self->tls_psk_len);
 
   fpi_ssm_next_state (transfer->ssm);
+}
+
+static void
+fpc1022_open_bulk_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                      gpointer user_data, GError *error)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+  int cur_state;
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  if (self->bulk_recv_len + transfer->actual_length > sizeof (self->bulk_buf))
+    {
+      fp_err ("Bulk buffer overflow during open");
+      fpi_ssm_mark_failed (transfer->ssm,
+                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+      return;
+    }
+
+  memcpy (self->bulk_buf + self->bulk_recv_len,
+          transfer->buffer, transfer->actual_length);
+  self->bulk_recv_len += transfer->actual_length;
+
+  cur_state = fpi_ssm_get_cur_state (transfer->ssm);
+  if (cur_state == FPC1022_OPEN_WAIT_INIT_RESULT)
+    fpc1022_open_wait_init_continue (dev, transfer->ssm);
+  else
+    fpc1022_open_bulk_read_continue (dev, transfer->ssm);
+}
+
+static void
+fpc1022_open_wait_init_continue (FpDevice *dev, FpiSsm *ssm)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+  gboolean complete;
+
+  if (!fpc1022_prepare_bulk_event (self, ssm, &complete))
+    return;
+
+  if (complete)
+    {
+      Fpc1022EvtHdr *hdr = (Fpc1022EvtHdr *) self->bulk_buf;
+      guint32 code = GUINT32_FROM_LE (hdr->code);
+      gsize event_len = self->evt_total_len;
+
+      fp_dbg ("Open bulk event: code=0x%02x len=%" G_GSIZE_FORMAT, code, event_len);
+
+      if (code == FPC1022_EVT_INIT_RESULT)
+        {
+          if (event_len >= 38)
+            {
+              guint16 width = *(guint16 *) (self->bulk_buf + 16);
+              guint16 height = *(guint16 *) (self->bulk_buf + 18);
+              char fw[16] = { 0 };
+              memcpy (fw, self->bulk_buf + 20, MIN (sizeof (fw) - 1, event_len - 20));
+              fp_dbg ("Sensor INIT_RESULT: %dx%d, fw=%s",
+                      GUINT16_FROM_LE (width), GUINT16_FROM_LE (height), fw);
+            }
+          fpc1022_consume_bulk_event (self);
+          fpi_ssm_next_state (ssm);
+          return;
+        }
+
+      /* Consume unexpected event and keep waiting */
+      fpc1022_consume_bulk_event (self);
+    }
+
+  fpc1022_submit_bulk_read (dev, ssm, fpc1022_open_bulk_cb, FPC1022_DATA_TIMEOUT);
+}
+
+static void
+fpc1022_open_tls_send_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                          gpointer user_data, GError *error)
+{
+  if (error)
+    {
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  fpc1022_tls_handshake_step (dev, transfer->ssm);
+}
+
+static void
+fpc1022_open_bulk_read_continue (FpDevice *dev, FpiSsm *ssm)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+  gboolean complete;
+
+  if (!fpc1022_prepare_bulk_event (self, ssm, &complete))
+    return;
+
+  if (complete)
+    {
+      Fpc1022EvtHdr *hdr = (Fpc1022EvtHdr *) self->bulk_buf;
+      guint32 code = GUINT32_FROM_LE (hdr->code);
+      gsize event_len = self->evt_total_len;
+
+      fp_dbg ("Handshake bulk event: code=0x%02x len=%" G_GSIZE_FORMAT, code, event_len);
+
+      if (code == FPC1022_EVT_TLS)
+        {
+          if (event_len > FPC1022_EVT_HDR_SIZE)
+            {
+              BIO_write (self->bio_in,
+                         self->bulk_buf + FPC1022_EVT_HDR_SIZE,
+                         event_len - FPC1022_EVT_HDR_SIZE);
+            }
+          fpc1022_consume_bulk_event (self);
+          fpc1022_tls_handshake_step (dev, ssm);
+          return;
+        }
+
+      fpc1022_consume_bulk_event (self);
+    }
+
+  fpc1022_submit_bulk_read (dev, ssm, fpc1022_open_bulk_cb, FPC1022_DATA_TIMEOUT);
+}
+
+static void
+fpc1022_tls_handshake_step (FpDevice *dev, FpiSsm *ssm)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+  int ret;
+  size_t pending;
+
+  if (SSL_is_init_finished (self->ssl))
+    {
+      self->tls_established = TRUE;
+      fp_dbg ("TLS 1.2 handshake completed! Cipher: %s",
+              SSL_get_cipher_name (self->ssl));
+      fpi_ssm_mark_completed (ssm);
+      return;
+    }
+
+  ret = SSL_connect (self->ssl);
+  if (ret <= 0)
+    {
+      int err = SSL_get_error (self->ssl, ret);
+      if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE)
+        {
+          fp_err ("SSL_connect failed with error %d", err);
+          ERR_print_errors_fp (stderr);
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+          return;
+        }
+    }
+
+  pending = BIO_ctrl_pending (self->bio_out);
+  if (pending > 0)
+    {
+      guint8 chunk[64];
+      int n = BIO_read (self->bio_out, chunk, MIN (pending, sizeof (chunk)));
+      if (n > 0)
+        {
+          fp_dbg ("Sending TLS handshake data (%d bytes, pending: %" G_GSIZE_FORMAT ")",
+                  n, pending - n);
+          fpc1022_send_ctrl_full (dev, ssm, FPC1022_CMD_TLS_DATA, 1, 0,
+                                  chunk, n, fpc1022_open_tls_send_cb);
+          return;
+        }
+    }
+
+  if (SSL_is_init_finished (self->ssl))
+    {
+      self->tls_established = TRUE;
+      fp_dbg ("TLS 1.2 handshake completed! Cipher: %s",
+              SSL_get_cipher_name (self->ssl));
+      fpi_ssm_mark_completed (ssm);
+      return;
+    }
+
+  fpc1022_open_bulk_read_continue (dev, ssm);
 }
 
 static void
@@ -740,13 +694,13 @@ fpc1022_open_ssm_run (FpiSsm *ssm, FpDevice *dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case FPC1022_OPEN_INDICATE_S_STATE:
-      fp_dbg ("Sending cmd_indicate_s_state (S0)");
+      fp_dbg ("Sending CMD_INDICATE_S_STATE (S0)");
       fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_INDICATE_S_STATE,
                          FPC1022_S_STATE_S0, 0, NULL, 0);
       break;
 
     case FPC1022_OPEN_GET_STATE:
-      fp_dbg ("Sending cmd_get_state");
+      fp_dbg ("Sending CMD_GET_STATE");
       transfer = fpi_usb_transfer_new (dev);
       fpi_usb_transfer_fill_control (transfer,
                                      G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
@@ -761,26 +715,32 @@ fpc1022_open_ssm_run (FpiSsm *ssm, FpDevice *dev)
 
     case FPC1022_OPEN_CMD_INIT:
       {
-        fp_dbg ("Sending cmd_init");
-        guint8 init_data[FPC1022_INIT_DATA_SIZE] = { FPC1022_ARM_OP_INIT, 0x2f, 0x11, 0x17 };
+        guint32 init_token = GUINT32_TO_LE (FPC1022_INIT_TOKEN_BASE);
+        fp_dbg ("Sending CMD_INIT (token 0x%08x)", FPC1022_INIT_TOKEN_BASE);
         fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_INIT, 0x0001, 0,
-                           init_data, sizeof (init_data));
+                           (guint8 *) &init_token, sizeof (init_token));
       }
       break;
 
     case FPC1022_OPEN_WAIT_INIT_RESULT:
-      fp_dbg ("Waiting for init result on bulk IN");
-      fpc1022_open_continue (dev, ssm);
+      fp_dbg ("Waiting for EVT_INIT_RESULT on bulk IN");
+      fpc1022_open_wait_init_continue (dev, ssm);
+      break;
+
+    case FPC1022_OPEN_SET_TLS_KEY:
+      fp_dbg ("Sending CMD_SET_TLS_KEY (119 bytes)");
+      fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_SET_TLS_KEY, 0, 0,
+                         fpc1022_sealed_key_pkt, sizeof (fpc1022_sealed_key_pkt));
       break;
 
     case FPC1022_OPEN_GET_TLS_KEY:
-      fp_dbg ("Sending cmd_get_tls_key");
+      fp_dbg ("Sending CMD_GET_TLS_KEY");
       transfer = fpi_usb_transfer_new (dev);
       fpi_usb_transfer_fill_control (transfer,
                                      G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
                                      G_USB_DEVICE_REQUEST_TYPE_VENDOR,
                                      G_USB_DEVICE_RECIPIENT_DEVICE,
-                                     FPC1022_CMD_GET_TLS_KEY, 0, 0, 1000);
+                                     FPC1022_CMD_GET_TLS_KEY, 0, 0, 119);
       transfer->ssm = ssm;
       fpi_usb_transfer_submit (transfer, FPC1022_CTRL_TIMEOUT,
                                fpc1022_get_transfer_cancellable (self, ssm),
@@ -788,128 +748,22 @@ fpc1022_open_ssm_run (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case FPC1022_OPEN_TLS_INIT:
-      {
-        fp_dbg ("Initializing TLS-PSK");
-
-        /* Create SSL context - we are the server, sensor is client */
-        self->ssl_ctx = SSL_CTX_new (TLS_server_method ());
-        if (!self->ssl_ctx)
-          {
-            fp_err ("SSL_CTX_new failed");
-            fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
-            return;
-          }
-
-        SSL_CTX_set_options (self->ssl_ctx, SSL_OP_NO_COMPRESSION);
-        if (!SSL_CTX_use_psk_identity_hint (self->ssl_ctx, NULL))
-          {
-            fp_err ("Failed to configure TLS PSK identity hint");
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
-            return;
-          }
-        SSL_CTX_set_psk_server_callback (self->ssl_ctx, fpc1022_psk_server_cb);
-
-        /* Allow PSK and ECDHE-PSK cipher suites.
-         * The sensor's mbedTLS prefers ECDHE-PSK-WITH-AES-128-CBC-SHA256. */
-        if (!SSL_CTX_set_cipher_list (self->ssl_ctx,
-                                      "ECDHE-PSK-AES128-CBC-SHA256:"
-                                      "ECDHE-PSK-AES256-CBC-SHA384:"
-                                      "PSK-AES128-CBC-SHA256:PSK-AES256-CBC-SHA384:"
-                                      "PSK-AES128-CBC-SHA:PSK-AES256-CBC-SHA:"
-                                      "PSK-AES128-GCM-SHA256:PSK-AES256-GCM-SHA384"))
-          {
-            fp_err ("Failed to configure TLS cipher list");
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
-            return;
-          }
-
-        /* Create SSL connection */
-        self->ssl = SSL_new (self->ssl_ctx);
-        if (!self->ssl)
-          {
-            fp_err ("SSL_new failed");
-            fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
-            return;
-          }
-
-        SSL_set_app_data (self->ssl, self);
-
-        /* Create memory BIOs for data exchange */
-        self->bio_in = BIO_new (BIO_s_mem ());
-        self->bio_out = BIO_new (BIO_s_mem ());
-        if (!self->bio_in || !self->bio_out)
-          {
-            fp_err ("BIO_new failed");
-            BIO_free (self->bio_in);
-            BIO_free (self->bio_out);
-            self->bio_in = NULL;
-            self->bio_out = NULL;
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
-            return;
-          }
-        BIO_set_mem_eof_return (self->bio_in, -1);
-        BIO_set_mem_eof_return (self->bio_out, -1);
-        SSL_set_bio (self->ssl, self->bio_in, self->bio_out);
-
-        /* Set as server and start accepting */
-        SSL_set_accept_state (self->ssl);
-
-        /* Match reference: limit TLS record size to 4096 bytes */
-        if (!SSL_set_max_send_fragment (self->ssl, 4096))
-          {
-            fp_err ("Failed to configure TLS fragment size");
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
-            return;
-          }
-
-        /* Send cmd_tls_init to the device to start TLS handshake */
-        fp_dbg ("Sending cmd_tls_init");
-        fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_TLS_INIT, 0x0001, 0, NULL, 0);
-      }
+      fp_dbg ("Sending CMD_TLS_INIT");
+      if (!fpc1022_init_tls_client (self))
+        {
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
+          return;
+        }
+      fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_TLS_INIT, 1, 0, NULL, 0);
       break;
 
     case FPC1022_OPEN_TLS_HANDSHAKE:
+      fp_dbg ("Beginning TLS 1.2 PSK client handshake");
       fpc1022_tls_handshake_step (dev, ssm);
       break;
 
     default:
       g_assert_not_reached ();
-    }
-}
-
-/* The TLS handshake flush callback needs to loop back to reading,
- * not advance the SSM. Override the behavior by jumping back. */
-static void
-fpc1022_tls_handshake_flush_cb (FpiUsbTransfer *transfer, FpDevice *dev,
-                                gpointer user_data, GError *error)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
-
-  if (error)
-    {
-      fpi_ssm_mark_failed (transfer->ssm, error);
-      return;
-    }
-
-  /* Check if more to send */
-  if (fpc1022_flush_handshake_packet (dev, transfer->ssm))
-    return;
-
-  /* All flushed */
-  if (self->tls_established)
-    {
-      /* Post-handshake flush complete — advance SSM */
-      fp_dbg ("TLS handshake flush complete, advancing SSM");
-      fpi_ssm_next_state (transfer->ssm);
-    }
-  else
-    {
-      /* Mid-handshake flush — read more from device */
-      fpc1022_open_continue (dev, transfer->ssm);
     }
 }
 
@@ -919,35 +773,31 @@ fpc1022_cleanup_resources (FpImageDevice *dev)
   FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
   GError *error = NULL;
 
-  /* Cancel any pending operations */
   g_cancellable_cancel (self->interrupt_cancellable);
   g_clear_object (&self->interrupt_cancellable);
 
-  /* Free TLS resources */
   if (self->ssl)
     {
-      SSL_free (self->ssl); /* also frees bio_in and bio_out */
+      SSL_free (self->ssl);
       self->ssl = NULL;
       self->bio_in = NULL;
       self->bio_out = NULL;
     }
+
   if (self->ssl_ctx)
     {
       SSL_CTX_free (self->ssl_ctx);
       self->ssl_ctx = NULL;
     }
 
-  /* Free image buffer */
   g_clear_pointer (&self->tls_rx_buf, g_byte_array_unref);
 
-  /* Clear PSK */
-  memset (self->tls_psk, 0, sizeof (self->tls_psk));
-  self->tls_psk_len = 0;
+  OPENSSL_cleanse (self->tls_psk, sizeof (self->tls_psk));
+
   self->tls_established = FALSE;
   self->bulk_recv_len = 0;
   self->evt_total_len = 0;
 
-  /* Release USB interface */
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                   0, 0, &error);
 
@@ -957,6 +807,7 @@ fpc1022_cleanup_resources (FpImageDevice *dev)
 static void
 fpc1022_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
+  FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
   FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
 
   self->open_ssm = NULL;
@@ -965,64 +816,22 @@ fpc1022_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     {
       g_autoptr(GError) cleanup_error = NULL;
 
-      cleanup_error = fpc1022_cleanup_resources (FP_IMAGE_DEVICE (dev));
+      cleanup_error = fpc1022_cleanup_resources (img_dev);
       if (cleanup_error)
         fp_warn ("Failed to clean up after open error: %s",
                  cleanup_error->message);
+      fpi_image_device_open_complete (img_dev, error);
+      return;
     }
 
-  fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), error);
+  fp_dbg ("FPC1022 open and TLS tunnel established successfully");
+  fpi_image_device_open_complete (img_dev, NULL);
 }
 
-/* ---- Capture SSM ----
- *
- * After TLS is established, ALL sensor events (finger_down, image, etc.)
- * arrive encrypted inside ev_tls (0x05) frames on the USB bulk endpoint.
- * We must:
- *   1. Read raw USB bulk data and accumulate complete events
- *   2. For ev_tls events: feed payload into SSL BIO, then SSL_read
- *   3. Parse the decrypted data as inner fpc_event structures
- *   4. Handle inner events (finger_down → get image, image → submit)
- */
+/* ---- Capture SSM Implementation ---- */
 
-/* Forward declarations */
-static void fpc1022_capture_process_event (FpDevice *dev,
-                                           FpiSsm   *ssm);
-static void fpc1022_process_tls_data (FpDevice *dev,
-                                      FpiSsm   *ssm);
-static void fpc1022_start_deactivation (FpImageDevice *dev);
 static void fpc1022_capture_continue (FpDevice *dev, FpiSsm *ssm);
-
-/* Send any pending TLS output (from bio_out) to the device.
- * After TLS handshake, SSL_read rarely produces output, but handle it. */
-static void
-fpc1022_flush_tls_output (FpDevice *dev)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
-  int pending = BIO_ctrl_pending (self->bio_out);
-
-  while (pending > 0)
-    {
-      guint8 buf[FPC1022_BULK_MAX_PKT];
-      int n = BIO_read (self->bio_out, buf, MIN (pending, FPC1022_BULK_MAX_PKT));
-
-      if (n <= 0)
-        break;
-
-      FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
-      fpi_usb_transfer_fill_control (t,
-                                     G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
-                                     G_USB_DEVICE_REQUEST_TYPE_VENDOR,
-                                     G_USB_DEVICE_RECIPIENT_DEVICE,
-                                     FPC1022_CMD_TLS_DATA, 0x0001, 0, n);
-      memcpy (t->buffer, buf, n);
-      fpi_usb_transfer_submit (t, FPC1022_CTRL_TIMEOUT,
-                               self->interrupt_cancellable,
-                               fpc1022_ctrl_cmd_noop_cb, NULL);
-
-      pending = BIO_ctrl_pending (self->bio_out);
-    }
-}
+static void fpc1022_start_deactivation (FpImageDevice *dev);
 
 static void
 fpc1022_capture_bulk_cb (FpiUsbTransfer *transfer, FpDevice *dev,
@@ -1043,10 +852,9 @@ fpc1022_capture_bulk_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       return;
     }
 
-  /* Accumulate data into bulk_buf (events may span multiple USB packets) */
   if (self->bulk_recv_len + transfer->actual_length > sizeof (self->bulk_buf))
     {
-      fp_err ("Bulk buffer overflow in capture");
+      fp_err ("Bulk buffer overflow during capture");
       self->bulk_recv_len = 0;
       self->evt_total_len = 0;
       fpi_ssm_mark_failed (transfer->ssm,
@@ -1059,6 +867,144 @@ fpc1022_capture_bulk_cb (FpiUsbTransfer *transfer, FpDevice *dev,
   self->bulk_recv_len += transfer->actual_length;
 
   fpc1022_capture_continue (dev, transfer->ssm);
+}
+
+static void
+fpc1022_capture_process_event (FpDevice *dev, FpiSsm *ssm)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+  Fpc1022EvtHdr *hdr = (Fpc1022EvtHdr *) self->bulk_buf;
+  guint32 code = GUINT32_FROM_LE (hdr->code);
+  gsize event_len = self->evt_total_len;
+  int state = fpi_ssm_get_cur_state (ssm);
+
+  fp_dbg ("Capture USB event: code=0x%02x len=%" G_GSIZE_FORMAT " state=%d",
+          code, event_len, state);
+
+  if (state == FPC1022_CAPTURE_WAIT_EVENT)
+    {
+      switch (code)
+        {
+        case FPC1022_EVT_FINGER_DOWN:
+          fp_dbg ("Finger touch detected (EVT_FINGER_DOWN)");
+          fpc1022_consume_bulk_event (self);
+          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
+          fpi_ssm_jump_to_state (ssm, FPC1022_CAPTURE_GET_IMAGE);
+          return;
+
+        case FPC1022_EVT_FINGER_UP:
+          fp_dbg ("Finger up event received");
+          fpc1022_consume_bulk_event (self);
+          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
+          fpc1022_capture_continue (dev, ssm);
+          return;
+
+        case FPC1022_EVT_HELLO:
+          fp_dbg ("Sensor hello/ready event, awaiting finger");
+          fpc1022_consume_bulk_event (self);
+          fpc1022_capture_continue (dev, ssm);
+          return;
+
+        default:
+          fp_dbg ("Ignoring event 0x%02x while waiting for finger", code);
+          fpc1022_consume_bulk_event (self);
+          fpc1022_capture_continue (dev, ssm);
+          return;
+        }
+    }
+
+  if (state == FPC1022_CAPTURE_RECV_IMAGE)
+    {
+      if (code == FPC1022_EVT_TLS)
+        {
+          if (event_len > FPC1022_EVT_HDR_SIZE)
+            {
+              BIO_write (self->bio_in,
+                         self->bulk_buf + FPC1022_EVT_HDR_SIZE,
+                         event_len - FPC1022_EVT_HDR_SIZE);
+            }
+          fpc1022_consume_bulk_event (self);
+
+          guint8 dec_buf[2048];
+          int n;
+          while ((n = SSL_read (self->ssl, dec_buf, sizeof (dec_buf))) > 0)
+            {
+              g_byte_array_append (self->tls_rx_buf, dec_buf, n);
+            }
+
+          fp_dbg ("Decrypted %u / %d TLS image bytes",
+                  self->tls_rx_buf->len, FPC1022_TLS_MSG_MAX_SIZE);
+
+          if (self->tls_rx_buf->len >= FPC1022_TLS_MSG_MAX_SIZE)
+            {
+              fp_dbg ("Full decrypted image message received!");
+              fpi_ssm_jump_to_state (ssm, FPC1022_CAPTURE_GET_FW_VERSION);
+              return;
+            }
+
+          fpc1022_capture_continue (dev, ssm);
+          return;
+        }
+
+      if (code == FPC1022_EVT_FINGER_UP)
+        {
+          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
+          fpc1022_consume_bulk_event (self);
+          fpc1022_capture_continue (dev, ssm);
+          return;
+        }
+
+      fpc1022_consume_bulk_event (self);
+      fpc1022_capture_continue (dev, ssm);
+      return;
+    }
+
+  if (state == FPC1022_CAPTURE_CONSUME_ACK)
+    {
+      if (code == FPC1022_EVT_TLS)
+        {
+          if (event_len > FPC1022_EVT_HDR_SIZE)
+            {
+              BIO_write (self->bio_in,
+                         self->bulk_buf + FPC1022_EVT_HDR_SIZE,
+                         event_len - FPC1022_EVT_HDR_SIZE);
+              guint8 dummy[128];
+              while (SSL_read (self->ssl, dummy, sizeof (dummy)) > 0)
+                ;
+            }
+        }
+
+      fpc1022_consume_bulk_event (self);
+
+      if (self->tls_rx_buf->len >= FPC1022_TLS_MSG_MAX_SIZE)
+        {
+          g_autoptr(FpImage) img = NULL;
+          FpImage *scaled = NULL;
+
+          fp_dbg ("Extracting %dx%d image and upscaling 2x to 128x352",
+                  FPC1022_IMG_WIDTH, FPC1022_IMG_HEIGHT);
+
+          img = fp_image_new (FPC1022_IMG_WIDTH, FPC1022_IMG_HEIGHT);
+          memcpy (img->data,
+                  self->tls_rx_buf->data + FPC1022_TLS_MSG_HDR_SIZE,
+                  FPC1022_IMG_SIZE);
+          img->flags = 0;
+          scaled = fpc1022_scale_nn_2x (img);
+
+          g_byte_array_set_size (self->tls_rx_buf, 0);
+          fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), scaled);
+          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
+          fpi_ssm_mark_completed (ssm);
+          return;
+        }
+
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+      return;
+    }
+
+  /* Catch-all for unexpected states */
+  fpc1022_consume_bulk_event (self);
+  fpc1022_capture_continue (dev, ssm);
 }
 
 static void
@@ -1078,216 +1024,9 @@ fpc1022_capture_continue (FpDevice *dev, FpiSsm *ssm)
       return;
     }
 
-  waiting_finger = fpi_ssm_get_cur_state (ssm) == FPC1022_CAPTURE_ARM_SENSOR;
+  waiting_finger = fpi_ssm_get_cur_state (ssm) == FPC1022_CAPTURE_WAIT_EVENT;
   timeout = waiting_finger ? FPC1022_FINGER_TIMEOUT : FPC1022_DATA_TIMEOUT;
   fpc1022_submit_bulk_read (dev, ssm, fpc1022_capture_bulk_cb, timeout);
-}
-
-/* Process a complete USB bulk event during capture.
- * After TLS, all meaningful events come as ev_tls (0x05). */
-static void
-fpc1022_capture_process_event (FpDevice *dev, FpiSsm *ssm)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
-  Fpc1022EvtHdr *hdr = (Fpc1022EvtHdr *) self->bulk_buf;
-  guint32 code = GUINT32_FROM_BE (hdr->code);
-  gsize event_len = self->evt_total_len;
-  int state = fpi_ssm_get_cur_state (ssm);
-
-  fp_dbg ("capture USB event: code=0x%02x len=%u state=%d",
-          code, (guint) event_len, state);
-
-  if (code == FPC1022_EVT_TLS)
-    {
-      /* Feed TLS payload into SSL BIO */
-      gsize payload_off = sizeof (Fpc1022EvtHdr);
-
-      if (event_len > payload_off &&
-          !fpc1022_tls_feed_input (self,
-                                   self->bulk_buf + payload_off,
-                                   event_len - payload_off))
-        {
-          fpi_ssm_mark_failed (ssm,
-                               fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-          return;
-        }
-
-      fpc1022_consume_bulk_event (self);
-
-      /* Decrypt and process inner events */
-      fpc1022_process_tls_data (dev, ssm);
-      return;
-    }
-
-  /* Handle raw (non-TLS) events.
-   * Some firmware versions may send finger_down etc. as raw events. */
-  switch (code)
-    {
-    case FPC1022_EVT_FINGER_DOWN:
-      fp_dbg ("Finger detected (raw event)!");
-      fpc1022_consume_bulk_event (self);
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
-      fpi_ssm_jump_to_state (ssm, FPC1022_CAPTURE_GET_IMAGE);
-      return;
-
-    case FPC1022_EVT_FINGER_UP:
-      fp_dbg ("Finger up (raw event)");
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
-      break;
-
-    case FPC1022_EVT_ARM_RESULT:
-      fp_dbg ("Arm result (raw event)");
-      break;
-
-    case FPC1022_EVT_HELLO:
-      fp_dbg ("Hello event (raw), sensor is alive");
-      break;
-
-    default:
-      fp_dbg ("Unhandled raw event 0x%02x during capture (state=%d)", code, state);
-      break;
-    }
-
-  fpc1022_consume_bulk_event (self);
-  fpc1022_capture_continue (dev, ssm);
-}
-
-/* Read decrypted data from SSL and process inner TLS messages.
- * Firmware 11.x TLS inner messages: {cmdid(4B BE), total_len(4B BE), ...metadata...}
- * Messages may be split or coalesced across SSL_read() calls. */
-static void
-fpc1022_process_tls_data (FpDevice *dev, FpiSsm *ssm)
-{
-  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
-  int state = fpi_ssm_get_cur_state (ssm);
-  guint8 ssl_buf[8192];
-  int ssl_err;
-  int n;
-
-  while ((n = SSL_read (self->ssl, ssl_buf, sizeof (ssl_buf))) > 0)
-    {
-      fp_dbg ("SSL_read: %d decrypted bytes (state=%d)", n, state);
-      g_byte_array_append (self->tls_rx_buf, ssl_buf, n);
-    }
-
-  ssl_err = SSL_get_error (self->ssl, n);
-  if (ssl_err != SSL_ERROR_WANT_READ)
-    {
-      fp_err ("SSL_read error: %d: %s", ssl_err,
-              ERR_error_string (ERR_get_error (), NULL));
-      fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-      return;
-    }
-
-  while (self->tls_rx_buf->len >= 8)
-    {
-      guint32 cmdid;
-      guint32 total_len;
-
-      memcpy (&cmdid, self->tls_rx_buf->data, sizeof (cmdid));
-      memcpy (&total_len, self->tls_rx_buf->data + sizeof (cmdid),
-              sizeof (total_len));
-      cmdid = GUINT32_FROM_BE (cmdid);
-      total_len = GUINT32_FROM_BE (total_len);
-
-      if (total_len < 8)
-        {
-          fp_err ("Invalid TLS inner message length: %u", total_len);
-          fpi_ssm_mark_failed (ssm,
-                               fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-          return;
-        }
-
-      if (total_len > FPC1022_TLS_MSG_MAX_SIZE)
-        {
-          fp_err ("Oversized TLS inner message: %u", total_len);
-          fpi_ssm_mark_failed (ssm,
-                               fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-          return;
-        }
-
-      if (self->tls_rx_buf->len < total_len)
-        break;
-
-      fp_dbg ("TLS inner message: cmdid=%u total_len=%u", cmdid, total_len);
-
-      switch (cmdid)
-        {
-        case FPC1022_EVT_DEAD_PIXEL_REPORT:
-          fp_dbg ("Dead pixel report (via TLS), len=%u", total_len);
-          break;
-
-        case FPC1022_EVT_IMAGE:
-          {
-            g_autoptr(FpImage) img = NULL;
-            FpImage *scaled;
-
-            if (total_len != FPC1022_TLS_MSG_HDR_SIZE + FPC1022_IMG_SIZE)
-              {
-                fp_err ("Invalid TLS image message length: %u", total_len);
-                fpi_ssm_mark_failed (ssm,
-                                     fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
-                return;
-              }
-
-            img = fp_image_new (FPC1022_IMG_WIDTH, FPC1022_IMG_HEIGHT);
-            memcpy (img->data,
-                    self->tls_rx_buf->data + FPC1022_TLS_MSG_HDR_SIZE,
-                    FPC1022_IMG_SIZE);
-            img->flags = 0;
-            scaled = fpc1022_scale_nn_2x (img);
-
-            g_byte_array_remove_range (self->tls_rx_buf, 0, total_len);
-            fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), scaled);
-            fpi_ssm_mark_completed (ssm);
-            return;
-          }
-
-        case FPC1022_EVT_ARM_RESULT:
-          fp_dbg ("Arm result (via TLS)");
-          break;
-
-        case FPC1022_EVT_FINGER_DOWN:
-          fp_dbg ("Finger detected (via TLS)!");
-          g_byte_array_remove_range (self->tls_rx_buf, 0, total_len);
-          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
-          fpi_ssm_jump_to_state (ssm, FPC1022_CAPTURE_GET_IMAGE);
-          return;
-
-        case FPC1022_EVT_FINGER_UP:
-          fp_dbg ("Finger up (via TLS)");
-          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
-          break;
-
-        case FPC1022_EVT_USB_LOGS:
-          fp_dbg ("USB logs (via TLS)");
-          break;
-
-        default:
-          fp_dbg ("Unknown TLS cmdid %u, ignoring", cmdid);
-          break;
-        }
-
-      g_byte_array_remove_range (self->tls_rx_buf, 0, total_len);
-    }
-
-  /* Continue reading */
-  fpc1022_flush_tls_output (dev);
-  fpc1022_capture_continue (dev, ssm);
-}
-
-static void
-fpc1022_capture_arm_cb (FpiUsbTransfer *transfer, FpDevice *dev,
-                        gpointer user_data, GError *error)
-{
-  if (error)
-    {
-      fpi_ssm_mark_failed (transfer->ssm, error);
-      return;
-    }
-
-  /* Resume buffered TLS messages before reading another USB event. */
-  fpc1022_process_tls_data (dev, transfer->ssm);
 }
 
 static void
@@ -1297,60 +1036,61 @@ fpc1022_capture_ssm_run (FpiSsm *ssm, FpDevice *dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case FPC1022_CAPTURE_STOP_ARM:
+    case FPC1022_CAPTURE_ARM_SENSOR:
       {
-        /* Reference implementation does stop→abort→session_off→start after TLS.
-         * Send arm with stop flag (0x12) to reset sensor state. */
-        fp_dbg ("Stopping sensor (arm 0x12)");
-        guint8 stop_data[FPC1022_INIT_DATA_SIZE] = { FPC1022_ARM_OP_STOP, 0x2f, 0x11, 0x17 };
+        guint32 token = GUINT32_TO_LE (self->arm_token++);
+        fp_dbg ("Arming sensor for finger detection (token 0x%08x)",
+                GUINT32_FROM_LE (token));
         fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_ARM, 0x0001, 0,
-                           stop_data, FPC1022_INIT_DATA_SIZE);
+                           (guint8 *) &token, sizeof (token));
       }
       break;
 
-    case FPC1022_CAPTURE_STOP_ABORT:
-      fp_dbg ("Sending abort");
-      fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_ABORT, 1, 0, NULL, 0);
+    case FPC1022_CAPTURE_WAIT_EVENT:
+      fp_dbg ("Waiting for finger event on bulk IN");
+      fpc1022_capture_continue (dev, ssm);
       break;
 
-    case FPC1022_CAPTURE_STOP_SESSION_OFF:
+    case FPC1022_CAPTURE_GET_IMAGE:
+      fp_dbg ("Requesting image capture (CMD_GET_IMG)");
+      g_byte_array_set_size (self->tls_rx_buf, 0);
+      fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_GET_IMG, 0x0000, 0, NULL, 0);
+      break;
+
+    case FPC1022_CAPTURE_RECV_IMAGE:
+      fp_dbg ("Receiving TLS encrypted image chunks");
+      fpc1022_capture_continue (dev, ssm);
+      break;
+
+    case FPC1022_CAPTURE_GET_FW_VERSION:
+      fp_dbg ("Housekeeping: CMD_GET_FW_VERSION");
+      fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_GET_FW_VERSION, 0x0000, 0, NULL, 0);
+      break;
+
+    case FPC1022_CAPTURE_GET_DEAD_PIXELS:
+      fp_dbg ("Housekeeping: CMD_GET_DEAD_PIXELS");
+      fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_GET_DEAD_PIXELS, 0x0000, 0, NULL, 0);
+      break;
+
+    case FPC1022_CAPTURE_GET_KPI:
       {
-        /* session_off may stall if no session is active - ignore errors */
-        fp_dbg ("Sending session_off (fingerprint_off)");
-        FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
-        fpi_usb_transfer_fill_control (t,
-                                       G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
+        fp_dbg ("Housekeeping: CMD_GET_KPI");
+        FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
+        fpi_usb_transfer_fill_control (transfer,
+                                       G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
                                        G_USB_DEVICE_REQUEST_TYPE_VENDOR,
                                        G_USB_DEVICE_RECIPIENT_DEVICE,
-                                       FPC1022_CMD_FINGERPRINT_OFF, 0, 0, 0);
-        t->ssm = ssm;
-        fpi_usb_transfer_submit (t, FPC1022_CTRL_TIMEOUT,
+                                       FPC1022_CMD_GET_KPI, 0, 0, 28);
+        transfer->ssm = ssm;
+        fpi_usb_transfer_submit (transfer, FPC1022_CTRL_TIMEOUT,
                                  fpc1022_get_transfer_cancellable (self, ssm),
                                  fpc1022_ctrl_cmd_ignore_error_cb, NULL);
       }
       break;
 
-    case FPC1022_CAPTURE_ARM_SENSOR:
-      {
-        fp_dbg ("Arming sensor for finger detection");
-        guint8 arm_data[FPC1022_INIT_DATA_SIZE] = { FPC1022_ARM_OP_START, 0x2f, 0x11, 0x17 };
-
-        /* Keep framing buffers for the lifetime of the TLS connection.
-         * Finish arming before buffered events can advance the capture SSM. */
-        fpc1022_send_ctrl_full (dev, ssm, FPC1022_CMD_ARM, 0x0001, 0,
-                                arm_data, sizeof (arm_data),
-                                fpc1022_capture_arm_cb);
-      }
-      break;
-
-    case FPC1022_CAPTURE_GET_IMAGE:
-      fp_dbg ("Requesting image capture");
-      fpc1022_send_ctrl (dev, ssm, FPC1022_CMD_GET_IMG, 0x0000, 0, NULL, 0);
-      break;
-
-    case FPC1022_CAPTURE_RECV_IMAGE:
-      fp_dbg ("Receiving image data via TLS");
-      fpc1022_process_tls_data (dev, ssm);
+    case FPC1022_CAPTURE_CONSUME_ACK:
+      fp_dbg ("Consuming TLS ack packet on bulk IN");
+      fpc1022_capture_continue (dev, ssm);
       break;
 
     default:
@@ -1375,40 +1115,24 @@ fpc1022_capture_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (error)
     {
+      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
       fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
       return;
     }
 
-  /* The image-device layer requests the next scan after extraction finishes. */
   fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
 }
 
-/* ---- Deactivate SSM ---- */
+/* ---- Deactivate SSM Implementation ---- */
 
 static void
 fpc1022_deact_ssm_run (FpiSsm *ssm, FpDevice *dev)
 {
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case FPC1022_DEACT_ARM_STOP:
-      {
-        fp_dbg ("Stopping sensor (arm stop)");
-        guint8 stop_data[FPC1022_INIT_DATA_SIZE] = { FPC1022_ARM_OP_STOP, 0x2f, 0x11, 0x17 };
-        fpc1022_send_ctrl_full (dev, ssm, FPC1022_CMD_ARM, 0x0001, 0,
-                                stop_data, sizeof (stop_data),
-                                fpc1022_ctrl_cmd_ignore_error_cb);
-      }
-      break;
-
     case FPC1022_DEACT_ABORT:
-      fp_dbg ("Sending abort");
+      fp_dbg ("Sending CMD_ABORT for deactivation");
       fpc1022_send_ctrl_full (dev, ssm, FPC1022_CMD_ABORT, 1, 0, NULL, 0,
-                              fpc1022_ctrl_cmd_ignore_error_cb);
-      break;
-
-    case FPC1022_DEACT_SESSION_OFF:
-      fp_dbg ("Sending fingerprint session off");
-      fpc1022_send_ctrl_full (dev, ssm, FPC1022_CMD_FINGERPRINT_OFF, 0, 0, NULL, 0,
                               fpc1022_ctrl_cmd_ignore_error_cb);
       break;
 
@@ -1463,6 +1187,7 @@ fpc1022_img_open (FpImageDevice *dev)
   self->evt_total_len = 0;
   self->tls_established = FALSE;
   self->deactivating = FALSE;
+  self->arm_token = FPC1022_INIT_TOKEN_BASE + 1;
   self->interrupt_cancellable = g_cancellable_new ();
 
   /* Start open SSM */
@@ -1525,7 +1250,6 @@ fpc1022_deactivate (FpImageDevice *dev)
 
   self->deactivating = TRUE;
 
-  /* Cancel any pending capture */
   if (self->capture_ssm)
     {
       g_cancellable_cancel (self->interrupt_cancellable);
@@ -1535,7 +1259,7 @@ fpc1022_deactivate (FpImageDevice *dev)
   fpc1022_start_deactivation (dev);
 }
 
-/* ---- GObject boilerplate ---- */
+/* ---- GObject Boilerplate ---- */
 
 static void
 fpi_device_fpc1022_init (FpiDeviceFpc1022 *self)
@@ -1549,10 +1273,12 @@ fpi_device_fpc1022_class_init (FpiDeviceFpc1022Class *klass)
   FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
 
   dev_class->id = "fpc1022";
-  dev_class->full_name = "FPC1022 Fingerprint Sensor";
+  dev_class->full_name = "FPC Fingerprint Reader (Disum 10a5:a920)";
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+  dev_class->temp_hot_seconds = -1;
+  dev_class->temp_cold_seconds = 0;
 
   img_class->img_open = fpc1022_img_open;
   img_class->img_close = fpc1022_img_close;
