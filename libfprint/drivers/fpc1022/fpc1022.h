@@ -34,7 +34,7 @@
 #define FPC1022_EP_IN_MAX_BUF_SIZE 2048
 #define FPC1022_CTRL_TIMEOUT 2000
 #define FPC1022_DATA_TIMEOUT 15000
-#define FPC1022_FINGER_TIMEOUT 600000      /* 10 min for finger wait */
+#define FPC1022_FINGER_TIMEOUT 30000       /* finger-wait poll; re-armed on timeout */
 #define FPC1022_BULK_MAX_PKT 64
 #define FPC1022_EVT_HDR_SIZE 12
 #define FPC1022_TLS_RECORD_MAX_SIZE ((16 * 1024) + 2048)
@@ -144,6 +144,13 @@ typedef enum {
   FPC1022_DEACT_NUM_STATES,
 } Fpc1022DeactState;
 
+/* Why the open SSM is being re-run on an already open device */
+typedef enum {
+  FPC1022_REOPEN_NONE = 0,
+  FPC1022_REOPEN_ACTIVATE,   /* TLS session was lost: renegotiate in activate */
+  FPC1022_REOPEN_RESUME,     /* renegotiate after system resume */
+} Fpc1022Reopen;
+
 G_DECLARE_FINAL_TYPE (FpiDeviceFpc1022, fpi_device_fpc1022, FPI,
                       DEVICE_FPC1022, FpImageDevice)
 
@@ -173,4 +180,11 @@ struct _FpiDeviceFpc1022
   FpiSsm       *capture_ssm;
   gboolean      deactivating;
   GCancellable *interrupt_cancellable;
+
+  /* Lifecycle / recovery state */
+  gboolean      closing;          /* close requested, waiting for capture_ssm */
+  gboolean      await_finger;     /* image device is in AWAIT_FINGER_ON */
+  gboolean      suspended;        /* system suspend in progress */
+  gboolean      suspend_pending;  /* suspend completion waits for capture_ssm */
+  Fpc1022Reopen reopen;           /* why open_ssm is re-running a handshake */
 };

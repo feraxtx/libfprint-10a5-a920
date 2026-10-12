@@ -22,6 +22,7 @@
 
 #include "drivers_api.h"
 #include "fpc1022.h"
+#include "fpc1022-recovery.h"
 #include "fpi-image.h"
 
 #include <openssl/err.h>
@@ -335,11 +336,12 @@ fpc1022_init_tls_client (FpiDeviceFpc1022 *self)
 static GCancellable *
 fpc1022_get_transfer_cancellable (FpiDeviceFpc1022 *self, FpiSsm *ssm)
 {
-  if (ssm == self->open_ssm)
+  if (ssm == self->open_ssm && self->reopen == FPC1022_REOPEN_NONE)
     return fpi_device_get_cancellable (FP_DEVICE (self));
 
   return self->interrupt_cancellable;
 }
+
 
 static void
 fpc1022_ctrl_cmd_cb (FpiUsbTransfer *transfer, FpDevice *dev,
@@ -804,13 +806,52 @@ fpc1022_cleanup_resources (FpImageDevice *dev)
   return error;
 }
 
+static void fpc1022_start_capture (FpDevice *dev);
+static void fpc1022_finish_close (FpImageDevice *dev);
+
 static void
 fpc1022_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
   FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+  Fpc1022Reopen reopen = self->reopen;
 
   self->open_ssm = NULL;
+  self->reopen = FPC1022_REOPEN_NONE;
+
+  if (reopen != FPC1022_REOPEN_NONE)
+    {
+      /* Renegotiation on an already open device: resources are released
+       * later by close, never here. */
+      if (error)
+        {
+          fp_warn ("TLS renegotiation failed: %s", error->message);
+          self->tls_established = FALSE;
+        }
+      else
+        {
+          fp_dbg ("TLS session renegotiated");
+        }
+
+      if (reopen == FPC1022_REOPEN_ACTIVATE)
+        {
+          fpi_image_device_activate_complete (img_dev, error);
+          return;
+        }
+
+      self->suspended = FALSE;
+      fpi_device_resume_complete (dev, NULL);
+
+      if (error)
+        {
+          fpi_image_device_session_error (img_dev, error);
+          return;
+        }
+
+      if (self->await_finger)
+        fpc1022_start_capture (dev);
+      return;
+    }
 
   if (error)
     {
@@ -828,6 +869,27 @@ fpc1022_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   fpi_image_device_open_complete (img_dev, NULL);
 }
 
+static void
+fpc1022_reopen_start (FpiDeviceFpc1022 *self, Fpc1022Reopen why)
+{
+  self->reopen = why;
+  self->tls_established = FALSE;
+  self->bulk_recv_len = 0;
+  self->evt_total_len = 0;
+  if (self->tls_rx_buf)
+    g_byte_array_set_size (self->tls_rx_buf, 0);
+
+  /* The previous cancellable may already be cancelled (suspend/close) */
+  g_clear_object (&self->interrupt_cancellable);
+  self->interrupt_cancellable = g_cancellable_new ();
+  self->arm_token = FPC1022_INIT_TOKEN_BASE + 1;
+
+  self->open_ssm = fpi_ssm_new (FP_DEVICE (self), fpc1022_open_ssm_run,
+                                FPC1022_OPEN_NUM_STATES);
+  fpi_ssm_start (self->open_ssm, fpc1022_open_ssm_done);
+}
+
+
 /* ---- Capture SSM Implementation ---- */
 
 static void fpc1022_capture_continue (FpDevice *dev, FpiSsm *ssm);
@@ -841,15 +903,36 @@ fpc1022_capture_bulk_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
   if (error)
     {
-      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+      gboolean waiting = fpi_ssm_get_cur_state (transfer->ssm) ==
+                         FPC1022_CAPTURE_WAIT_EVENT;
+
+      switch (fpc1022_classify_transfer_error (
+                g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED),
+                g_error_matches (error, G_USB_DEVICE_ERROR,
+                                 G_USB_DEVICE_ERROR_TIMED_OUT),
+                waiting))
         {
+        case FPC1022_ERR_COMPLETE:
+          /* Always finish the SSM; capture_ssm_done() decides what follows
+           * (deactivate, close, suspend). Returning here left it hanging. */
           g_error_free (error);
-          if (self->deactivating)
-            fpi_ssm_mark_completed (transfer->ssm);
+          fpi_ssm_mark_completed (transfer->ssm);
+          return;
+
+        case FPC1022_ERR_REARM:
+          /* Idle poll expired: re-arm. The control transfer fails fast if
+           * the sensor is gone, which triggers recovery. */
+          fp_dbg ("Finger wait poll timed out, re-arming sensor");
+          g_error_free (error);
+          fpi_ssm_jump_to_state (transfer->ssm, FPC1022_CAPTURE_ARM_SENSOR);
+          return;
+
+        case FPC1022_ERR_FAIL:
+        default:
+          fp_warn ("Capture bulk transfer failed: %s", error->message);
+          fpi_ssm_mark_failed (transfer->ssm, error);
           return;
         }
-      fpi_ssm_mark_failed (transfer->ssm, error);
-      return;
     }
 
   if (self->bulk_recv_len + transfer->actual_length > sizeof (self->bulk_buf))
@@ -1105,6 +1188,23 @@ fpc1022_capture_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   self->capture_ssm = NULL;
 
+  if (self->closing)
+    {
+      if (error)
+        g_error_free (error);
+      fpc1022_finish_close (FP_IMAGE_DEVICE (dev));
+      return;
+    }
+
+  if (self->suspend_pending)
+    {
+      if (error)
+        g_error_free (error);
+      self->suspend_pending = FALSE;
+      fpi_device_suspend_complete (dev, NULL);
+      return;
+    }
+
   if (self->deactivating)
     {
       if (error)
@@ -1115,6 +1215,9 @@ fpc1022_capture_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (error)
     {
+      fp_warn ("Capture failed (%s), TLS session will be renegotiated",
+               error->message);
+      self->tls_established = FALSE;
       fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
       fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
       return;
@@ -1122,6 +1225,7 @@ fpc1022_capture_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
 }
+
 
 /* ---- Deactivate SSM Implementation ---- */
 
@@ -1187,6 +1291,12 @@ fpc1022_img_open (FpImageDevice *dev)
   self->evt_total_len = 0;
   self->tls_established = FALSE;
   self->deactivating = FALSE;
+  self->closing = FALSE;
+  self->await_finger = FALSE;
+  self->suspended = FALSE;
+  self->suspend_pending = FALSE;
+  self->reopen = FPC1022_REOPEN_NONE;
+  self->capture_ssm = NULL;
   self->arm_token = FPC1022_INIT_TOKEN_BASE + 1;
   self->interrupt_cancellable = g_cancellable_new ();
 
@@ -1197,14 +1307,38 @@ fpc1022_img_open (FpImageDevice *dev)
 }
 
 static void
+fpc1022_finish_close (FpImageDevice *dev)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+  GError *error;
+
+  self->closing = FALSE;
+  self->await_finger = FALSE;
+
+  error = fpc1022_cleanup_resources (dev);
+  if (error)
+    fp_warn ("Error while releasing device: %s", error->message);
+  fpi_image_device_close_complete (dev, error);
+}
+
+static void
 fpc1022_img_close (FpImageDevice *dev)
 {
-  GError *error;
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
 
   fp_dbg ("Closing FPC1022 device");
 
-  error = fpc1022_cleanup_resources (dev);
-  fpi_image_device_close_complete (dev, error);
+  /* Never free the TLS state under a running capture: cancel it and let
+   * capture_ssm_done() finish the close once the SSM has really stopped. */
+  if (self->capture_ssm)
+    {
+      fp_dbg ("Capture still running at close, cancelling before cleanup");
+      self->closing = TRUE;
+      g_cancellable_cancel (self->interrupt_cancellable);
+      return;
+    }
+
+  fpc1022_finish_close (dev);
 }
 
 static void
@@ -1218,8 +1352,10 @@ fpc1022_activate (FpImageDevice *dev)
 
   if (!self->tls_established)
     {
-      fpi_image_device_activate_complete (dev,
-                                          fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
+      /* A previous error or a suspend invalidated the TLS tunnel:
+       * renegotiate it instead of failing every following operation. */
+      fp_dbg ("TLS session not established, renegotiating");
+      fpc1022_reopen_start (self, FPC1022_REOPEN_ACTIVATE);
       return;
     }
 
@@ -1227,19 +1363,74 @@ fpc1022_activate (FpImageDevice *dev)
 }
 
 static void
+fpc1022_start_capture (FpDevice *dev)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+
+  if (self->deactivating || self->closing || self->suspended ||
+      self->capture_ssm || self->open_ssm)
+    return;
+
+  /* Start capture loop */
+  self->capture_ssm = fpi_ssm_new (dev, fpc1022_capture_ssm_run,
+                                   FPC1022_CAPTURE_NUM_STATES);
+  fpi_ssm_start (self->capture_ssm, fpc1022_capture_ssm_done);
+}
+
+static void
 fpc1022_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 {
   FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
 
-  if (state != FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON ||
-      self->deactivating || self->capture_ssm)
+  self->await_finger = (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON);
+
+  if (!self->await_finger)
     return;
 
-  /* Start capture loop */
-  self->capture_ssm = fpi_ssm_new (FP_DEVICE (dev), fpc1022_capture_ssm_run,
-                                   FPC1022_CAPTURE_NUM_STATES);
-  fpi_ssm_start (self->capture_ssm, fpc1022_capture_ssm_done);
+  fpc1022_start_capture (FP_DEVICE (dev));
 }
+
+static void
+fpc1022_suspend (FpDevice *dev)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+
+  fp_dbg ("Suspending FPC1022 device");
+  self->suspended = TRUE;
+
+  if (self->capture_ssm)
+    {
+      /* Completed from capture_ssm_done() once the transfer is cancelled */
+      self->suspend_pending = TRUE;
+      g_cancellable_cancel (self->interrupt_cancellable);
+      return;
+    }
+
+  if (self->open_ssm)
+    g_cancellable_cancel (self->interrupt_cancellable);
+
+  fpi_device_suspend_complete (dev, NULL);
+}
+
+static void
+fpc1022_resume (FpDevice *dev)
+{
+  FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
+
+  fp_dbg ("Resuming FPC1022 device");
+
+  if (self->open_ssm)
+    {
+      self->suspended = FALSE;
+      fpi_device_resume_complete (dev, NULL);
+      return;
+    }
+
+  /* The sensor may have lost power or its TLS state while suspended;
+   * always renegotiate. Capture is restarted when that completes. */
+  fpc1022_reopen_start (self, FPC1022_REOPEN_RESUME);
+}
+
 
 static void
 fpc1022_deactivate (FpImageDevice *dev)
@@ -1279,6 +1470,8 @@ fpi_device_fpc1022_class_init (FpiDeviceFpc1022Class *klass)
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   dev_class->temp_hot_seconds = -1;
   dev_class->temp_cold_seconds = 0;
+  dev_class->suspend = fpc1022_suspend;
+  dev_class->resume = fpc1022_resume;
 
   img_class->img_open = fpc1022_img_open;
   img_class->img_close = fpc1022_img_close;

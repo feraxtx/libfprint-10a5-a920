@@ -1,6 +1,6 @@
 Name:           libfprint-fpc1022
 Version:        1.95.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Asynchronous library for fingerprint readers with FPC 10a5:a920 support
 
 License:        LGPL-2.1-or-later
@@ -74,6 +74,10 @@ Development headers and libraries for %{name}.
 %{_datadir}/gir-1.0/FPrint-2.0.gir
 
 %changelog
+* Mon Oct 12 2026 feraxhp <feraxhp+gh@gmail.com> - 1.95.0-2
+- fpc1022: fix capture SSM hanging on cancel, safe close during capture,
+  TLS renegotiation after errors, suspend/resume support, bounded finger wait
+
 * Thu Oct 08 2026 feraxhp <feraxhp+gh@gmail.com> - 1.95.0-1
 - Release 1.95.0 with production-ready FPC 10a5:a920 driver
 - Fix overheating shutdown bug, add memory cleansing, unit tests and packaging

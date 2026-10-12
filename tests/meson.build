@@ -326,6 +326,7 @@ endif
 if 'fpc1022' in drivers
     unit_tests += [
         'fpc1022-kdf',
+        'fpc1022-recovery',
     ]
 endif
 
