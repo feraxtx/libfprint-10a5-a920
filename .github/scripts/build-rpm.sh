@@ -29,8 +29,8 @@ mkdir -p "$work/rpmbuild"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 cp "$root/packaging/fedora/libfprint.spec" "$work/rpmbuild/SPECS/"
 
 tar --exclude=.git --exclude=builddir --exclude=artifacts \
-    --transform="s,^\.,libfprint-fpc1022-1.95.0," \
-    -czf "$work/rpmbuild/SOURCES/libfprint-fpc1022-1.95.0.tar.gz" .
+    --transform="s,^\.,libfprint-fpc1022-1.95.100," \
+    -czf "$work/rpmbuild/SOURCES/libfprint-fpc1022-1.95.100.tar.gz" .
 
 rpmbuild --define "_topdir $work/rpmbuild" -ba "$work/rpmbuild/SPECS/libfprint.spec"
 

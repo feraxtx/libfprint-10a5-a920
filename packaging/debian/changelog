@@ -1,3 +1,9 @@
+libfprint-fpc1022 (1.95.100) unstable; urgency=medium
+
+  * Release 1.95.100.
+
+ -- feraxhp <feraxhp+gh@gmail.com>  Tue, 13 Oct 2026 13:22:00 -0500
+
 libfprint-fpc1022 (1.95.0) unstable; urgency=medium
 
   * Release 1.95.0 with production-ready FPC 10a5:a920 driver.
