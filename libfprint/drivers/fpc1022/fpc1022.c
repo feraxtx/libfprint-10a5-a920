@@ -548,11 +548,14 @@ fpc1022_open_wait_init_continue (FpDevice *dev, FpiSsm *ssm)
   FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
   gboolean complete;
 
-  if (!fpc1022_prepare_bulk_event (self, ssm, &complete))
-    return;
-
-  if (complete)
+  while (TRUE)
     {
+      if (!fpc1022_prepare_bulk_event (self, ssm, &complete))
+        return;
+
+      if (!complete)
+        break;
+
       Fpc1022EvtHdr *hdr = (Fpc1022EvtHdr *) self->bulk_buf;
       guint32 code = GUINT32_FROM_LE (hdr->code);
       gsize event_len = self->evt_total_len;
@@ -575,7 +578,7 @@ fpc1022_open_wait_init_continue (FpDevice *dev, FpiSsm *ssm)
           return;
         }
 
-      /* Consume unexpected event and keep waiting */
+      /* Consume unexpected event and keep checking buffer */
       fpc1022_consume_bulk_event (self);
     }
 
@@ -601,11 +604,14 @@ fpc1022_open_bulk_read_continue (FpDevice *dev, FpiSsm *ssm)
   FpiDeviceFpc1022 *self = FPI_DEVICE_FPC1022 (dev);
   gboolean complete;
 
-  if (!fpc1022_prepare_bulk_event (self, ssm, &complete))
-    return;
-
-  if (complete)
+  while (TRUE)
     {
+      if (!fpc1022_prepare_bulk_event (self, ssm, &complete))
+        return;
+
+      if (!complete)
+        break;
+
       Fpc1022EvtHdr *hdr = (Fpc1022EvtHdr *) self->bulk_buf;
       guint32 code = GUINT32_FROM_LE (hdr->code);
       gsize event_len = self->evt_total_len;
@@ -808,6 +814,7 @@ fpc1022_cleanup_resources (FpImageDevice *dev)
 
 static void fpc1022_start_capture (FpDevice *dev);
 static void fpc1022_finish_close (FpImageDevice *dev);
+static void fpc1022_start_deactivation (FpImageDevice *dev);
 
 static void
 fpc1022_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
@@ -841,6 +848,22 @@ fpc1022_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
       self->suspended = FALSE;
       fpi_device_resume_complete (dev, NULL);
+
+      if (self->closing)
+        {
+          if (error)
+            g_error_free (error);
+          fpc1022_finish_close (img_dev);
+          return;
+        }
+
+      if (self->deactivating)
+        {
+          if (error)
+            g_error_free (error);
+          fpc1022_start_deactivation (img_dev);
+          return;
+        }
 
       if (error)
         {
@@ -893,7 +916,6 @@ fpc1022_reopen_start (FpiDeviceFpc1022 *self, Fpc1022Reopen why)
 /* ---- Capture SSM Implementation ---- */
 
 static void fpc1022_capture_continue (FpDevice *dev, FpiSsm *ssm);
-static void fpc1022_start_deactivation (FpImageDevice *dev);
 
 static void
 fpc1022_capture_bulk_cb (FpiUsbTransfer *transfer, FpDevice *dev,
@@ -1192,6 +1214,12 @@ fpc1022_capture_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     {
       if (error)
         g_error_free (error);
+      /* A suspend may be waiting for this SSM too; never leave it hanging */
+      if (self->suspend_pending)
+        {
+          self->suspend_pending = FALSE;
+          fpi_device_suspend_complete (dev, NULL);
+        }
       fpc1022_finish_close (FP_IMAGE_DEVICE (dev));
       return;
     }
@@ -1338,6 +1366,15 @@ fpc1022_img_close (FpImageDevice *dev)
       return;
     }
 
+  /* Same for a TLS renegotiation (resume): open_ssm_done() finishes close */
+  if (self->open_ssm && self->reopen != FPC1022_REOPEN_NONE)
+    {
+      fp_dbg ("Renegotiation running at close, cancelling before cleanup");
+      self->closing = TRUE;
+      g_cancellable_cancel (self->interrupt_cancellable);
+      return;
+    }
+
   fpc1022_finish_close (dev);
 }
 
@@ -1441,7 +1478,7 @@ fpc1022_deactivate (FpImageDevice *dev)
 
   self->deactivating = TRUE;
 
-  if (self->capture_ssm)
+  if (self->capture_ssm || self->open_ssm)
     {
       g_cancellable_cancel (self->interrupt_cancellable);
       return;
