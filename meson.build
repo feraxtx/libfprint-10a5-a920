@@ -1,5 +1,5 @@
 project('libfprint', [ 'c', 'cpp' ],
-    version: '1.95.100',
+    version: '1.95.200',
     license: 'LGPLv2.1+',
     default_options: [
         'buildtype=debugoptimized',

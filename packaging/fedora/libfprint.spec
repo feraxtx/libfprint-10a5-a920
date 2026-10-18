@@ -1,5 +1,5 @@
 Name:           libfprint-fpc1022
-Version:        1.95.100
+Version:        1.95.200
 Release:        1%{?dist}
 Summary:        Asynchronous library for fingerprint readers with FPC 10a5:a920 support
 
@@ -74,6 +74,9 @@ Development headers and libraries for %{name}.
 %{_datadir}/gir-1.0/FPrint-2.0.gir
 
 %changelog
+* Sat Oct 17 2026 feraxhp <feraxhp+gh@gmail.com> - 1.95.200-1
+- Release 1.95.200
+
 * Tue Oct 13 2026 feraxhp <feraxhp+gh@gmail.com> - 1.95.100-1
 - Release 1.95.100
 
